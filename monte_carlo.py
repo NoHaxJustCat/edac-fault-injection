@@ -19,6 +19,7 @@ LEO Radiation Model Parameters
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import numpy as np
@@ -158,6 +159,95 @@ def inject_errors_leo(flat_page: np.ndarray,
         rec.total_bits_flipped += actual_size
 
     return out, rec
+
+
+def inject_errors_leo_conditional(
+        flat_page: np.ndarray,
+        seu_rate: float,
+        scrub_interval: float,
+        rng: np.random.Generator,
+        page_size_bits: int | None = None,
+) -> Tuple[np.ndarray, float]:
+    """Importance-sampling variant of inject_errors_leo.
+
+    Forces at least one radiation event by sampling from a zero-truncated
+    Poisson distribution (rejection sampling: draw until N >= 1), then
+    applies the LEO burst model exactly as in ``inject_errors_leo``.
+
+    The caller is responsible for weighting the resulting UBER estimate by
+    the returned probability ``p_flip = P(≥1 event) = 1 - exp(-λ)`` so that
+    the unconditional UBER is recovered::
+
+        UBER_true = p_flip * mean(UBER | ≥1 event)
+
+    This avoids wasting iterations on zero-event pages, giving much higher
+    resolution at low SEU rates where most Poisson draws would be zero.
+
+    Args:
+        flat_page      : 1-D uint8 array (encoded page).
+        seu_rate       : radiation event rate [events / bit / s].
+        scrub_interval : seconds between scrub events.
+        rng            : numpy random Generator.
+        page_size_bits : override total bit count (default: len * 8).
+
+    Returns:
+        ``(corrupted_page, p_flip)`` — page with ≥1 event applied and the
+        importance weight P(at least one event).
+    """
+    n_bytes = len(flat_page)
+    total_bits = page_size_bits if page_size_bits is not None else n_bytes * 8
+    lam_events = seu_rate * total_bits * scrub_interval
+
+    # P(at least one radiation event) — the importance weight
+    p_flip = 1.0 - math.exp(-lam_events) if lam_events < 700.0 else 1.0
+
+    if lam_events < 1e-300 or total_bits == 0:
+        # Essentially zero probability: flip one bit as a degenerate sample.
+        # The caller's p_flip weight will suppress this to near zero.
+        out = flat_page.copy()
+        out[0] ^= np.uint8(1)
+        return out, p_flip
+
+    # Zero-truncated Poisson: resample until n_events >= 1 (fast for λ > 0.01;
+    # expected number of rejection steps = exp(λ) / (exp(λ) - 1) ≤ 1/(1-e^-λ))
+    n_events = 0
+    while n_events == 0:
+        n_events = int(rng.poisson(lam_events))
+
+    # Identical partitioning / injection logic as inject_errors_leo
+    out = flat_page.copy()
+    rec = InjectionRecord()
+
+    n_bursts  = int(rng.binomial(n_events, 1.0 / 11.0))
+    n_singles = n_events - n_bursts
+    rec.n_single_seus   = n_singles
+    rec.n_burst_events  = n_bursts
+
+    if n_singles > 0:
+        n_flip = min(n_singles, total_bits)
+        positions = rng.choice(total_bits, size=n_flip, replace=False)
+        for pos in positions:
+            byte_idx = pos >> 3
+            bit_idx  = pos & 7
+            if byte_idx < n_bytes:
+                out[byte_idx] ^= np.uint8(1 << bit_idx)
+        rec.total_bits_flipped += n_flip
+
+    for _ in range(n_bursts):
+        burst_size = sample_burst_size(rng)
+        if burst_size <= 0:
+            continue
+        start_bit   = int(rng.integers(0, total_bits))
+        actual_size = min(burst_size, total_bits - start_bit)
+        for i in range(actual_size):
+            bit_pos  = start_bit + i
+            byte_idx = bit_pos >> 3
+            bit_idx  = bit_pos & 7
+            if byte_idx < n_bytes:
+                out[byte_idx] ^= np.uint8(1 << bit_idx)
+        rec.total_bits_flipped += actual_size
+
+    return out, p_flip
 
 
 # ══════════════════════════════════════════════════════════

@@ -40,7 +40,7 @@ import argparse
 import os
 import sys
 import multiprocessing
-from math import ceil
+from math import ceil, exp
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -53,7 +53,7 @@ from utils import (
     encode_with_rs, decode_with_rs,
     encode_with_bch, decode_with_bch,
 )
-from monte_carlo import inject_errors_leo, _POPCOUNT8
+from monte_carlo import inject_errors_leo, inject_errors_leo_conditional, _POPCOUNT8
 
 # ===========================================================
 #  OUTPUT DIRECTORY
@@ -68,7 +68,7 @@ PAGE_SIZES     = [4224, 8640]   # NAND page sizes to evaluate [bytes]
 NUM_SECTORS    = 8              # equal-sized sectors per page
 
 # SEU rate sweep -- same x-axis as compare_ecc_pagesizes
-SEU_RATE_SWEEP = np.logspace(-7, -6, 60)
+SEU_RATE_SWEEP = np.logspace(-8, -5, 40)
 
 # Scrubbing
 SCRUB_INTERVAL = 3600           # seconds between scrub events
@@ -77,7 +77,7 @@ SCRUB_INTERVAL = 3600           # seconds between scrub events
 UBER_REQ       = 1e-12
 
 # Monte Carlo settings
-NUM_ITERS      = 100             # iterations per (architecture x SEU-rate point)
+NUM_ITERS      = 10            # iterations per (architecture x SEU-rate point)
 # Cap at 61: Python 3.13 on Windows enforces a strict 61-worker handle limit.
 _CPU_COUNT  = os.cpu_count() or 1
 NUM_WORKERS = min(_CPU_COUNT, 61)
@@ -388,6 +388,46 @@ def _inject_burst(flat_page, seu_rate, scrub_interval, rng):
     return corrupted
 
 
+def _inject_random_conditional(flat_page, seu_rate, scrub_interval, rng):
+    """Conditional (importance-sampling) variant of _inject_random.
+
+    Forces at least one radiation event via zero-truncated Poisson sampling.
+    The caller must scale the resulting UBER by
+    ``p_flip = 1 - exp(-lambda)`` to recover the unconditional UBER.
+    """
+    out = flat_page.copy()
+    n_bytes = len(out)
+    total_bits = n_bytes * 8
+
+    if seu_rate < 1e-30 or total_bits == 0:
+        out[0] ^= np.uint8(1)
+        return out
+
+    lam_events = seu_rate * total_bits * scrub_interval
+    # Zero-truncated Poisson: resample until n_events >= 1
+    n_events = 0
+    while n_events == 0:
+        n_events = int(rng.poisson(lam_events))
+
+    n_flip = min(n_events, total_bits)
+    positions = rng.choice(total_bits, size=n_flip, replace=False)
+    for pos in positions:
+        out[pos >> 3] ^= np.uint8(1 << (pos & 7))
+    return out
+
+
+def _inject_burst_conditional(flat_page, seu_rate, scrub_interval, rng):
+    """Conditional (importance-sampling) variant of _inject_burst.
+
+    Forces at least one radiation event via zero-truncated Poisson sampling
+    and applies the full LEO burst model.  The caller must scale the resulting
+    UBER by ``p_flip = 1 - exp(-lambda)`` to recover the unconditional UBER.
+    """
+    corrupted, _ = inject_errors_leo_conditional(
+        flat_page, seu_rate, scrub_interval, rng)
+    return corrupted
+
+
 # ===========================================================
 #  WORKER  (top-level -> picklable on Windows / spawn)
 # ===========================================================
@@ -404,7 +444,13 @@ def _worker(task):
     Returns
     -------
     tuple
-        ``(arch_index, seu_rate, error_bits, total_bits)``
+        ``(arch_index, seu_rate, weighted_error_bits, total_data_bits)``
+
+        ``weighted_error_bits`` is a float equal to
+        ``p_flip * conditional_error_bits`` where
+        ``p_flip = 1 - exp(-\u03bb)`` is the probability that the page sees at
+        least one radiation event in the scrub window.  Dividing by
+        ``total_data_bits`` gives the true (unconditional) UBER.
     """
     try:
         (arch_index, arch_type, arch_params,
@@ -418,7 +464,19 @@ def _worker(task):
         error_bits = 0
         total_bits = 0
 
-        inject = _inject_burst if mode == "burst" else _inject_random
+        # ── Importance-sampling weight ─────────────────────────────────────
+        # P(at least one radiation event on the full encoded page during one
+        # scrub window).  Every simulated iteration is conditioned on having
+        # ≥1 event (zero-truncated Poisson), so the resulting UBER estimate
+        # must be multiplied by p_flip to recover the unconditional UBER:
+        #     UBER_true = p_flip × UBER_conditional
+        # This eliminates zero-event iterations and greatly improves resolution
+        # at low SEU rates where λ << 1 and most Poisson draws would be zero.
+        lam_page = seu_rate * (page_size * 8) * scrub_interval
+        p_flip = 1.0 - exp(-lam_page) if lam_page < 700.0 else 1.0
+
+        inject = (_inject_burst_conditional if mode == "burst"
+                  else _inject_random_conditional)
 
         # -- RS-only simulation path -------------------------
         if arch_type == "rs":
@@ -483,7 +541,8 @@ def _worker(task):
         else:
             return arch_index, seu_rate, 0, 1
 
-        return arch_index, seu_rate, error_bits, total_bits
+        # Scale by the importance weight: true UBER = p_flip × conditional UBER
+        return arch_index, seu_rate, p_flip * error_bits, total_bits
 
     except Exception as e:
         # Catch any unhandled exception to prevent worker process from crashing
