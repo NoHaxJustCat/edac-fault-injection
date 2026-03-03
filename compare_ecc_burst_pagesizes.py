@@ -38,6 +38,7 @@ section at the top of the file.
 
 import argparse
 import os
+import sys
 import multiprocessing
 from math import ceil
 
@@ -67,7 +68,7 @@ PAGE_SIZES     = [4224, 8640]   # NAND page sizes to evaluate [bytes]
 NUM_SECTORS    = 8              # equal-sized sectors per page
 
 # SEU rate sweep -- same x-axis as compare_ecc_pagesizes
-SEU_RATE_SWEEP = np.logspace(-9, -3, 60)
+SEU_RATE_SWEEP = np.logspace(-7, -6, 60)
 
 # Scrubbing
 SCRUB_INTERVAL = 3600           # seconds between scrub events
@@ -76,8 +77,10 @@ SCRUB_INTERVAL = 3600           # seconds between scrub events
 UBER_REQ       = 1e-12
 
 # Monte Carlo settings
-NUM_ITERS      = 20             # iterations per (architecture x SEU-rate point)
-NUM_WORKERS    = os.cpu_count() or 1
+NUM_ITERS      = 100             # iterations per (architecture x SEU-rate point)
+# Cap at 61: Python 3.13 on Windows enforces a strict 61-worker handle limit.
+_CPU_COUNT  = os.cpu_count() or 1
+NUM_WORKERS = min(_CPU_COUNT, 61)
 
 # ===========================================================
 #  PLOT STYLE
@@ -571,7 +574,7 @@ def run_analysis(page_size, mode, pool=None):
                 completed += 1
 
     if pool is not None:
-        # Reuse the caller-supplied pool (avoids re-spawn hang on Windows)
+        # Reuse the caller-supplied pool.
         _run_with_pool(pool)
     else:
         # On Windows, ProcessPoolExecutor automatically uses spawn.
@@ -655,6 +658,7 @@ def _plot_uber(page_size, archs, results_map, mode):
     fname = f"uber_{page_size}_{mode}.png"
     save_path = os.path.join(OUTPUT_DIR, fname)
     plt.savefig(save_path, dpi=150)
+    plt.close(fig)   # release figure; avoids Tk/Qt hang on plt.show()
     print(f"\n  UBER plot   ->  {save_path}")
 
 
@@ -762,7 +766,124 @@ def _plot_pareto(page_size, archs, results_map, mode):
     fname = f"pareto_{page_size}_{mode}.png"
     save_path = os.path.join(OUTPUT_DIR, fname)
     plt.savefig(save_path, dpi=150)
+    plt.close(fig)   # release figure; avoids Tk/Qt hang on plt.show()
     print(f"  Pareto plot ->  {save_path}")
+
+
+# ===========================================================
+#  MULTI-PAGE RUNNER
+# ===========================================================
+
+def run_all_analyses(page_sizes, mode):
+    """Run all page sizes in a single ProcessPoolExecutor batch.
+
+    Submitting every task before entering ``as_completed`` keeps the
+    worker pool continuously busy and avoids the Windows hang that
+    occurs when the pool goes idle between sequential batches.
+    """
+    # ------------------------------------------------------------------
+    # Phase 1: build archs + tasks for every page size
+    # ------------------------------------------------------------------
+    page_archs   = {}   # page_size -> list[Arch]
+    page_offsets = {}   # page_size -> global arch-index base
+    g_offset     = 0
+    all_tasks    = []
+
+    for page_size in page_sizes:
+        archs = build_archs(page_size)
+        sector_bytes = page_size // NUM_SECTORS
+        page_archs[page_size]   = archs
+        page_offsets[page_size] = g_offset
+
+        print(f"\n{'=' * 72}")
+        print(f"  {'BURST (LEO)' if mode == 'burst' else 'RANDOM'} MODE  --  "
+              f"page = {page_size} B  ({NUM_SECTORS} sectors x {sector_bytes} B)  "
+              f"scrub = {SCRUB_INTERVAL} s")
+        print(f"{'=' * 72}")
+        print(f"  {'Architecture':<45s}  {'k':>5s}  {'rate':>6s}")
+        print(f"  {'-' * 60}")
+        for arch in archs:
+            print(f"  {arch.label:<45s}  {arch.k:>5d}  {arch.rate:>.4f}")
+
+        for ai, arch in enumerate(archs):
+            for si, sr in enumerate(SEU_RATE_SWEEP):
+                seed = (g_offset + ai) * len(SEU_RATE_SWEEP) + si
+                all_tasks.append((
+                    g_offset + ai, arch.arch_type, arch.arch_params,
+                    float(sr), seed, NUM_ITERS, mode, SCRUB_INTERVAL
+                ))
+        g_offset += len(archs)
+
+    n_total_archs = g_offset
+    total_tasks   = len(all_tasks)
+    print(f"\n  SEU sweep : {SEU_RATE_SWEEP[0]:.1e} -- {SEU_RATE_SWEEP[-1]:.1e}"
+          f"  ({len(SEU_RATE_SWEEP)} points)  |  iters : {NUM_ITERS}"
+          f"  |  workers : {NUM_WORKERS}")
+    print(f"  Total tasks across all page sizes: {total_tasks}")
+    print(f"  Spawning {NUM_WORKERS} worker(s) ...")
+
+    # ------------------------------------------------------------------
+    # Phase 2: one pool – all tasks submitted before as_completed starts
+    # ------------------------------------------------------------------
+    all_results  = {i: {} for i in range(n_total_archs)}
+    arch_done_g  = {i: 0  for i in range(n_total_archs)}
+    completed    = 0
+
+    # Build a reverse lookup: global arch index -> (page_size, local arch index)
+    g_to_page = {}
+    for page_size in page_sizes:
+        off = page_offsets[page_size]
+        for ai in range(len(page_archs[page_size])):
+            g_to_page[off + ai] = (page_size, ai)
+
+    # Do NOT use a 'with' block here: on Windows the context-manager calls
+    # pool.shutdown(wait=True) which blocks until worker *processes* exit.
+    # Some Windows installations (especially Windows Store Python) never
+    # release the handles, causing an infinite hang.  Instead we collect all
+    # results ourselves and then call shutdown(wait=False) to detach.
+    pool = ProcessPoolExecutor(max_workers=NUM_WORKERS)
+    try:
+        future_to_task = {pool.submit(_worker, task): task for task in all_tasks}
+        for future in as_completed(future_to_task):
+            try:
+                ai_g, sr, error_bits, total_bits = future.result(timeout=300)
+                uber = error_bits / total_bits if total_bits > 0 else 0.0
+                all_results[ai_g][sr] = uber
+                arch_done_g[ai_g] += 1
+                completed += 1
+                ps, ai_local = g_to_page[ai_g]
+                archs = page_archs[ps]
+                if arch_done_g[ai_g] == len(SEU_RATE_SWEEP):
+                    print(f"    [{completed:>5d}/{total_tasks}]  "
+                          f"[{ps}B]  {archs[ai_local].label}")
+            except Exception as e:
+                task = future_to_task[future]
+                print(f"  WARNING: Task failed "
+                      f"(arch={task[0]}, seu_rate={task[3]:.1e}): {e}")
+                completed += 1
+    finally:
+        # wait=False: all futures already collected; don't block on process exit.
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    # ------------------------------------------------------------------
+    # Phase 3: plot per page size
+    # ------------------------------------------------------------------
+    for page_size in page_sizes:
+        archs  = page_archs[page_size]
+        offset = page_offsets[page_size]
+        results_map = {ai: all_results[offset + ai] for ai in range(len(archs))}
+
+        total_results = sum(len(results_map[ai]) for ai in range(len(archs)))
+        if total_results == 0:
+            print(f"\n  ERROR: No results for page_size={page_size}. "
+                  "All worker tasks failed.")
+            continue
+
+        _plot_uber(page_size, archs, results_map, mode)
+        _plot_pareto(page_size, archs, results_map, mode)
+
+    # Close all matplotlib figures to prevent hanging on Windows
+    plt.close('all')
 
 
 # ===========================================================
@@ -781,10 +902,10 @@ if __name__ == "__main__":
             "burst -- LEO radiation model with 10:1 single-to-burst ratio."))
     args = parser.parse_args()
 
-    # Create one shared pool for all page sizes to avoid Windows re-spawn hang.
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as shared_pool:
-        for page_size in PAGE_SIZES:
-            run_analysis(page_size, args.mode, pool=shared_pool)
-
-    plt.show()
+    # All page sizes are processed in a single executor lifetime so the
+    # worker pool never goes idle between batches (avoids Windows hang).
+    run_all_analyses(PAGE_SIZES, args.mode)
+    # plt.show() intentionally omitted: figures are saved as PNGs above.
+    # plt.show() with Tk/Qt backends on Windows Store Python can hang.
+    sys.exit(0)
 
