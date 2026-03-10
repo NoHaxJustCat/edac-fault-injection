@@ -77,7 +77,21 @@ SCRUB_INTERVAL = 3600           # seconds between scrub events
 UBER_REQ       = 1e-12
 
 # Monte Carlo settings
-NUM_ITERS      = 10            # iterations per (architecture x SEU-rate point)
+#
+# IMPORTANT — resolution floor:
+#   The finest non-zero UBER this estimator can return for a sector-based
+#   code (NUM_SECTORS sectors per page) is:
+#
+#       UBER_min = 1 / (NUM_ITERS × NUM_SECTORS)
+#
+#   With NUM_ITERS=10, NUM_SECTORS=8 → UBER_min ≈ 1.25×10⁻², which
+#   causes all curves to go flat once they hit that floor.
+#   Required iterations for a given target floor:
+#       NUM_ITERS ≥ 1 / (UBER_floor × NUM_SECTORS)
+#   e.g. 10⁻⁴ floor → ≥1 250 iters,  10⁻⁵ floor → ≥12 500 iters.
+#
+NUM_ITERS      = 10          # iterations per (architecture × SEU-rate point)
+                               # → floor ≈ 1.25×10⁻⁴  (smooth down to ~10⁻⁴)
 # Cap at 61: Python 3.13 on Windows enforces a strict 61-worker handle limit.
 _CPU_COUNT  = os.cpu_count() or 1
 NUM_WORKERS = min(_CPU_COUNT, 61)
@@ -676,12 +690,14 @@ def _plot_uber(page_size, archs, results_map, mode):
     mode_label = "LEO burst model" if mode == "burst" else "random (no bursts)"
     fig, ax = plt.subplots(figsize=(12, 7))
 
+    uber_floor = 1.0 / (NUM_ITERS * NUM_SECTORS)
+
     for ai, arch in enumerate(archs):
         srs   = np.array(sorted(results_map[ai].keys()))
         if len(srs) == 0:
             continue  # Skip if no results for this architecture
         ubers = np.array([results_map[ai][s] for s in srs])
-        mask  = ubers > 0
+        mask  = ubers > uber_floor   # clip at MC resolution floor
         kw    = dict(arch.style)
 
         # MC curve
@@ -701,6 +717,10 @@ def _plot_uber(page_size, archs, results_map, mode):
 
     ax.axhline(UBER_REQ, color="red", linestyle="--", linewidth=1.2,
                alpha=0.8, label=f"UBER requirement ({UBER_REQ:.0e})")
+
+    ax.axhline(uber_floor, color="#888888", linestyle=":", linewidth=1.0,
+               alpha=0.9,
+               label=f"MC floor  (1/({NUM_ITERS}×{NUM_SECTORS}) = {uber_floor:.2e})")
 
     ax.set_xlabel("SEU rate  [events / bit / s]")
     ax.set_ylabel("UBER  (Monte Carlo)")
@@ -959,7 +979,21 @@ if __name__ == "__main__":
         help=(
             "random (default) -- independent single-bit SEUs only.  "
             "burst -- LEO radiation model with 10:1 single-to-burst ratio."))
+    parser.add_argument(
+        "--mc-iter", type=int, default=None, metavar="N",
+        help=(
+            f"Monte Carlo iterations per (arch × SEU-rate) point "
+            f"(default: {NUM_ITERS}).  "
+            "Resolution floor = 1 / (N × NUM_SECTORS).  "
+            "Use ≥1250 for a 10⁻⁴ floor, ≥12500 for a 10⁻⁵ floor."))
     args = parser.parse_args()
+
+    if args.mc_iter is not None:
+        NUM_ITERS = args.mc_iter
+        if NUM_ITERS < 1:
+            parser.error("--mc-iter must be ≥ 1")
+        print(f"  [mc-iter override] NUM_ITERS = {NUM_ITERS}  "
+              f"(UBER floor ≈ {1/(NUM_ITERS*NUM_SECTORS):.2e})")
 
     # All page sizes are processed in a single executor lifetime so the
     # worker pool never goes idle between batches (avoids Windows hang).
