@@ -490,7 +490,7 @@ def run_analysis(page_size, display=None, n_iter=MC_ITERATIONS, seed=MC_SEED,
     # ══════════════════════════════════════════════════════
     #  PLOT 1 — UBER curves
     # ══════════════════════════════════════════════════════
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(6, 3))
     for c in configs:
         uber = results[c["label"]]
         mask = uber > 0
@@ -529,7 +529,7 @@ def run_analysis(page_size, display=None, n_iter=MC_ITERATIONS, seed=MC_SEED,
     # ══════════════════════════════════════════════════════
     #  PLOT 2 — Pareto (max tolerable SEU rate vs code rate)
     # ══════════════════════════════════════════════════════
-    fig2, ax2 = plt.subplots(figsize=(9, 6))
+    fig2, ax2 = plt.subplots(figsize=(6, 3))
     _markers = {"bch_only": "s", "rs_only": "^",
                 "rs_product": "P", "bch_product": "*",
                 "ldpc": "D"}
@@ -593,7 +593,7 @@ def run_analysis(page_size, display=None, n_iter=MC_ITERATIONS, seed=MC_SEED,
     # ══════════════════════════════════════════════════════
     #  PLOT 3 — ECC overwhelmed fraction
     # ══════════════════════════════════════════════════════
-    fig3, ax3 = plt.subplots(figsize=(12, 6))
+    fig3, ax3 = plt.subplots(figsize=(6, 3))
     for c in configs:
         sweep = mc_results[c['label']]
         owh = sweep.ecc_overwhelmed

@@ -190,6 +190,91 @@ def encode_with_bch(data, ecc_bytes, num_sectors):
     return np.concatenate(parts)
 
 
+def encode_with_bch_chunked(data, ecc_bytes, num_sectors, n_chunks):
+    """BCH-encode with sub-sector chunking for sectors too large for GF(2^13).
+
+    Each sector is split into *n_chunks* equal sub-blocks.  Each sub-block
+    gets its own BCH parity appended, so the encoded layout per sector is::
+
+        [chunk_0_data | chunk_0_ecc | chunk_1_data | chunk_1_ecc | ...]
+
+    The total encoded size per sector is therefore the same as before
+    (``sector_size = n_chunks × chunk_encoded_bytes``).
+
+    Args:
+        data        : flat numpy uint8 array of raw data (k bytes)
+        ecc_bytes   : BCH ECC bytes per chunk
+        num_sectors : number of equal-sized sectors
+        n_chunks    : number of BCH codewords per sector
+
+    Returns:
+        flat numpy uint8 array (all encoded sectors concatenated)
+    """
+    bch = _get_bch_cached(ecc_bytes)
+    sector_data_bytes = len(data) // num_sectors
+    chunk_data_bytes  = sector_data_bytes // n_chunks
+    sectors_2d = np.reshape(data, (num_sectors, sector_data_bytes))
+    parts = []
+    for s in range(num_sectors):
+        for c in range(n_chunks):
+            chunk = bytearray(sectors_2d[s, c * chunk_data_bytes:(c + 1) * chunk_data_bytes])
+            ecc   = bch.encode(chunk)
+            parts.append(np.frombuffer(bytes(chunk) + bytes(ecc), dtype=np.uint8))
+    return np.concatenate(parts)
+
+
+def decode_with_bch_chunked(sectors, ecc_bytes, n_chunks):
+    """BCH-decode with sub-sector chunking.
+
+    Expects each sector to contain *n_chunks* concatenated BCH codewords as
+    produced by :func:`encode_with_bch_chunked`.  If any chunk within a sector
+    is uncorrectable the whole sector is returned as ``None``.
+
+    Args:
+        sectors   : list of numpy arrays or None values
+        ecc_bytes : BCH ECC bytes per chunk (must match encoding)
+        n_chunks  : number of BCH codewords per sector
+
+    Returns:
+        (decoded_sectors, num_failures)
+    """
+    bch = _get_bch_cached(ecc_bytes)
+    valid = next((s for s in sectors if s is not None), None)
+    if valid is None:
+        return [None] * len(sectors), len(sectors)
+    chunk_encoded_bytes = len(valid) // n_chunks
+    chunk_data_bytes    = chunk_encoded_bytes - bch.ecc_bytes
+
+    decoded  = []
+    failures = 0
+    for sector in sectors:
+        if sector is None:
+            decoded.append(None)
+            failures += 1
+            continue
+        sector_data = bytearray()
+        ok = True
+        for c in range(n_chunks):
+            enc  = sector[c * chunk_encoded_bytes:(c + 1) * chunk_encoded_bytes]
+            data = bytearray(enc[:chunk_data_bytes])
+            ecc  = bytearray(enc[chunk_data_bytes:])
+            try:
+                nerr = bch.decode(data, ecc)
+            except Exception:
+                nerr = -1
+            if nerr < 0:
+                ok = False
+                break
+            bch.correct(data, ecc)
+            sector_data.extend(data)
+        if ok:
+            decoded.append(np.frombuffer(bytes(sector_data), dtype=np.uint8))
+        else:
+            decoded.append(None)
+            failures += 1
+    return decoded, failures
+
+
 # ── Corruption ───────────────────────────────────────────
 
 def corrupt_page(sectors, seu_rate, scrub_interval):

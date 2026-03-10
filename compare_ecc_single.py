@@ -29,8 +29,9 @@ Usage
     python compare_ecc_burst_pagesizes.py --mode burst  # LEO burst model
     python compare_ecc_burst_pagesizes.py --mode random # explicit random-only
 
-Note on BCH for 8640 B: a sector of 1080 B = 8640 bits exceeds the GF(2^13)
-BCH block-size limit (8191 bits), so no BCH configuration is feasible.
+BCH on large sectors (e.g. 8640 B page → 1080 B sector = 8640 bits) exceeds
+the GF(2^13) single-codeword limit (8191 bits), so each sector is automatically
+split into sub-sector chunks that each fit within the BCH codeword length.
 
 To adjust the simulation, edit the constants in the SIMULATION PARAMETERS
 section at the top of the file.
@@ -52,14 +53,21 @@ from utils import (
     compute_data_bytes, _make_bch,
     encode_with_rs, decode_with_rs,
     encode_with_bch, decode_with_bch,
+    encode_with_bch_chunked, decode_with_bch_chunked,
 )
 from monte_carlo import inject_errors_leo, inject_errors_leo_conditional, _POPCOUNT8
 
 # ===========================================================
 #  OUTPUT DIRECTORY
 # ===========================================================
-OUTPUT_DIR = os.path.join("images", "burst_pagesizes")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+_BASE_OUTPUT_DIR = os.path.join("images", "burst_pagesizes")
+
+
+def _get_output_dir(mode):
+    """Return (and create) the per-mode output subdirectory."""
+    path = os.path.join(_BASE_OUTPUT_DIR, mode)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 # ===========================================================
 #  SIMULATION PARAMETERS
@@ -112,16 +120,16 @@ TOL_COLORS = {
 
 mpl.rcParams.update({
     "font.family":     "serif",
-    "font.size":       10,
-    "axes.titlesize":  11,
-    "axes.labelsize":  10,
-    "legend.fontsize": 8,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
-    "axes.linewidth":  0.8,
-    "grid.linewidth":  0.5,
-    "lines.linewidth": 1.6,
-    "figure.dpi":      150,
+    "font.size":       15,
+    "axes.titlesize":  17,
+    "axes.labelsize":  15,
+    "legend.fontsize": 13,
+    "xtick.labelsize": 14,
+    "ytick.labelsize": 14,
+    "axes.linewidth":  1.2,
+    "grid.linewidth":  0.8,
+    "lines.linewidth": 2.2,
+    "figure.dpi":      200,
 })
 
 
@@ -258,37 +266,64 @@ def _make_rs_arch(nsym, page_size, color):
 
 
 def _make_bch_arch(ecc_bytes, page_size, color):
-    """Build a BCH-only architecture.  Returns None if infeasible."""
-    sector_bytes = page_size // NUM_SECTORS
-    bch_obj      = _make_bch(ecc_bytes)
-    data_len     = sector_bytes - bch_obj.ecc_bytes
-    max_data_bytes = (8191 - bch_obj.ecc_bits) // 8
+    """Build a BCH-only architecture, chunking the sector when it exceeds the
+    GF(2^13) BCH codeword limit (8191 bits / 1023 bytes).  Returns None only
+    if the chunk overhead still makes the configuration infeasible.
+    """
+    sector_bytes       = page_size // NUM_SECTORS
+    bch_obj            = _make_bch(ecc_bytes)
+    max_codeword_bytes = 8191 // 8           # = 1023 bytes
+    max_data_bytes     = (8191 - bch_obj.ecc_bits) // 8
 
-    if data_len <= 0 or data_len > max_data_bytes:
-        return None
+    # Find the smallest n_chunks such that each chunk fits in the BCH field.
+    # n_chunks must also divide sector_bytes evenly for equal-sized chunks.
+    n_chunks = ceil(sector_bytes / max_codeword_bytes)
+    while sector_bytes % n_chunks != 0:
+        n_chunks += 1
 
-    k = data_len * NUM_SECTORS
-    sector_bits = sector_bytes * 8
-    bch_t = bch_obj.t
+    chunk_encoded_bytes = sector_bytes // n_chunks
+    chunk_data_bytes    = chunk_encoded_bytes - bch_obj.ecc_bytes
 
-    def encode(data):
-        return encode_with_bch(data, ecc_bytes, NUM_SECTORS)
+    if chunk_data_bytes <= 0 or chunk_data_bytes > max_data_bytes:
+        return None  # ECC overhead exceeds chunk capacity
 
-    def decode(flat):
-        sl = page_size // NUM_SECTORS
-        sectors = [flat[i * sl:(i + 1) * sl] for i in range(NUM_SECTORS)]
-        decoded, _ = decode_with_bch(sectors, ecc_bytes)
-        return decoded
+    data_len   = n_chunks * chunk_data_bytes
+    k          = data_len * NUM_SECTORS
+    chunk_bits = chunk_encoded_bytes * 8
+    bch_t      = bch_obj.t
+
+    _nc = n_chunks  # captured by closures
+    if n_chunks == 1:
+        def encode(data):
+            return encode_with_bch(data, ecc_bytes, NUM_SECTORS)
+
+        def decode(flat):
+            sl = page_size // NUM_SECTORS
+            sectors_list = [flat[i * sl:(i + 1) * sl] for i in range(NUM_SECTORS)]
+            decoded, _ = decode_with_bch(sectors_list, ecc_bytes)
+            return decoded
+    else:
+        def encode(data):
+            return encode_with_bch_chunked(data, ecc_bytes, NUM_SECTORS, _nc)
+
+        def decode(flat):
+            sl = page_size // NUM_SECTORS
+            sectors_list = [flat[i * sl:(i + 1) * sl] for i in range(NUM_SECTORS)]
+            decoded, _ = decode_with_bch_chunked(sectors_list, ecc_bytes, _nc)
+            return decoded
 
     def analytical(r):
-        return uber_bch_only(r, bch_t, sector_bits)
+        # Sector fails if any of its n_chunks codewords fails (independent)
+        p_chunk_fail = uber_bch_only(r, bch_t, chunk_bits)
+        return 1.0 - (1.0 - p_chunk_fail) ** _nc
 
+    chunk_tag = f" ×{n_chunks}cw" if n_chunks > 1 else ""
     return Arch(
-        label=f"BCH {ecc_bytes}B (t={bch_t})",
+        label=f"BCH {ecc_bytes}B (t={bch_t}){chunk_tag}",
         k=k, page_size=page_size,
         arch_type="bch",
         arch_params=dict(ecc_bytes=ecc_bytes, page_size=page_size,
-                         num_sectors=NUM_SECTORS),
+                         num_sectors=NUM_SECTORS, n_chunks=n_chunks),
         encode_fn=encode, decode_fn=decode,
         style=dict(linestyle=":", color=color, linewidth=2),
         analytical_fn=analytical,
@@ -345,6 +380,8 @@ def build_archs(page_size):
     archs = []
 
     for nsym, color in zip([8, 16, 24], _RS_COLORS):
+        if nsym == 24 and page_size != 4224:
+            continue   # RS nsym=24 excluded for non-standard page sizes
         try:
             archs.append(_make_rs_arch(nsym, page_size, color))
         except ValueError:
@@ -515,18 +552,28 @@ def _worker(task):
         # -- BCH-only simulation path ------------------------
         elif arch_type == "bch":
             ecc_bytes = arch_params["ecc_bytes"]
+            n_chunks  = arch_params.get("n_chunks", 1)
             bch_obj   = _make_bch(ecc_bytes)
-            data_len  = page_size // ns - bch_obj.ecc_bytes
-            k         = data_len * ns
-            raw_data  = np.zeros(k, dtype=np.uint8)
-            encoded   = encode_with_bch(raw_data, ecc_bytes, ns)
-            dbps      = data_len * 8
+            chunk_encoded_bytes = sector_len // n_chunks
+            chunk_data_bytes    = chunk_encoded_bytes - bch_obj.ecc_bytes
+            data_len            = n_chunks * chunk_data_bytes
+            k                   = data_len * ns
+            raw_data            = np.zeros(k, dtype=np.uint8)
+            if n_chunks == 1:
+                encoded = encode_with_bch(raw_data, ecc_bytes, ns)
+            else:
+                encoded = encode_with_bch_chunked(raw_data, ecc_bytes, ns, n_chunks)
+            dbps = data_len * 8
 
             for _ in range(num_iters):
                 corrupted = inject(encoded, seu_rate, scrub_interval, rng)
                 sectors = [corrupted[i * sector_len:(i + 1) * sector_len]
                            for i in range(ns)]
-                decoded_sectors, _ = decode_with_bch(sectors, ecc_bytes)
+                if n_chunks == 1:
+                    decoded_sectors, _ = decode_with_bch(sectors, ecc_bytes)
+                else:
+                    decoded_sectors, _ = decode_with_bch_chunked(
+                        sectors, ecc_bytes, n_chunks)
                 for dec in decoded_sectors:
                     total_bits += dbps
                     if dec is not None:
@@ -668,8 +715,9 @@ def run_analysis(page_size, mode, pool=None):
         return archs, results_map
 
     # -- Save plots --------------------------------------
-    _plot_uber(page_size, archs, results_map, mode)
-    _plot_pareto(page_size, archs, results_map, mode)
+    out_dir = _get_output_dir(mode)
+    _plot_uber(page_size, archs, results_map, mode, out_dir)
+    _plot_pareto(page_size, archs, results_map, mode, out_dir)
 
     return archs, results_map
 
@@ -681,14 +729,25 @@ def run_analysis(page_size, mode, pool=None):
 _MARKERS = {"rs": "^", "bch": "s", "ldpc": "D"}
 
 
-def _plot_uber(page_size, archs, results_map, mode):
+def _analytical_results_map(archs):
+    """Build a results_map from analytical functions (no MC needed)."""
+    results = {}
+    for ai, arch in enumerate(archs):
+        results[ai] = {}
+        if arch.analytical_fn is not None:
+            for sr in SEU_RATE_SWEEP:
+                results[ai][float(sr)] = arch.analytical_fn(float(sr))
+    return results
+
+
+def _plot_uber(page_size, archs, results_map, mode, output_dir):
     """UBER vs SEU rate -- log-log, with analytical overlay.
 
     MC curves are solid/dashed; thin dotted lines of the same colour
     show the analytical (Poisson) prediction for comparison.
     """
     mode_label = "LEO burst model" if mode == "burst" else "random (no bursts)"
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(14, 8))
 
     uber_floor = 1.0 / (NUM_ITERS * NUM_SECTORS)
 
@@ -703,7 +762,7 @@ def _plot_uber(page_size, archs, results_map, mode):
         # MC curve
         if np.any(mask):
             ax.loglog(srs[mask], ubers[mask],
-                      marker=".", markersize=3,
+                      marker=".", markersize=5,
                       label=f"{arch.label}  (R={arch.rate:.3f})", **kw)
 
         # Analytical overlay (thin dotted line, same colour)
@@ -712,13 +771,13 @@ def _plot_uber(page_size, archs, results_map, mode):
             mask_a = uber_a > 0
             if np.any(mask_a):
                 ax.loglog(srs[mask_a], uber_a[mask_a],
-                          linewidth=0.8, linestyle=":", alpha=0.5,
+                          linewidth=1.2, linestyle=":", alpha=0.5,
                           color=kw.get("color", "gray"))
 
-    ax.axhline(UBER_REQ, color="red", linestyle="--", linewidth=1.2,
+    ax.axhline(UBER_REQ, color="red", linestyle="--", linewidth=1.8,
                alpha=0.8, label=f"UBER requirement ({UBER_REQ:.0e})")
 
-    ax.axhline(uber_floor, color="#888888", linestyle=":", linewidth=1.0,
+    ax.axhline(uber_floor, color="#888888", linestyle=":", linewidth=1.4,
                alpha=0.9,
                label=f"MC floor  (1/({NUM_ITERS}×{NUM_SECTORS}) = {uber_floor:.2e})")
 
@@ -726,22 +785,58 @@ def _plot_uber(page_size, archs, results_map, mode):
     ax.set_ylabel("UBER  (Monte Carlo)")
     ax.set_title(
         f"ECC UBER vs SEU Rate  --  page = {page_size} B, "
-        f"{NUM_SECTORS} sectors, scrub = {SCRUB_INTERVAL} s, "
-        f"N = {NUM_ITERS}  [{mode_label}]")
+        f"scrub = {SCRUB_INTERVAL} s,  N = {NUM_ITERS}")
     ax.set_ylim(bottom=1e-30)
-    ax.legend(loc="upper left", fontsize=7,
+    ax.legend(loc="upper left", fontsize=13,
               bbox_to_anchor=(0.01, 0.99), borderaxespad=0)
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
 
     fname = f"uber_{page_size}_{mode}.png"
-    save_path = os.path.join(OUTPUT_DIR, fname)
-    plt.savefig(save_path, dpi=150)
+    save_path = os.path.join(output_dir, fname)
+    plt.savefig(save_path, dpi=200)
     plt.close(fig)   # release figure; avoids Tk/Qt hang on plt.show()
     print(f"\n  UBER plot   ->  {save_path}")
 
 
-def _plot_pareto(page_size, archs, results_map, mode):
+def _plot_analytical_only(page_size, archs, mode, output_dir):
+    """Plot only the analytical (Poisson) UBER curves -- no MC needed."""
+    mode_label = "LEO burst model" if mode == "burst" else "random (no bursts)"
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    for arch in archs:
+        if arch.analytical_fn is None:
+            continue
+        uber_a = np.array([arch.analytical_fn(r) for r in SEU_RATE_SWEEP])
+        mask   = uber_a > 0
+        if not np.any(mask):
+            continue
+        kw = dict(arch.style)
+        ax.loglog(SEU_RATE_SWEEP[mask], uber_a[mask],
+                  label=f"{arch.label}  (R={arch.rate:.3f})", **kw)
+
+    ax.axhline(UBER_REQ, color="red", linestyle="--", linewidth=1.8,
+               alpha=0.8, label=f"UBER requirement ({UBER_REQ:.0e})")
+
+    ax.set_xlabel("SEU rate  [events / bit / s]")
+    ax.set_ylabel("UBER  (analytical)")
+    ax.set_title(
+        f"ECC UBER vs SEU Rate  --  page = {page_size} B, "
+        f"{NUM_SECTORS} sectors, scrub = {SCRUB_INTERVAL} s")
+    ax.set_ylim(bottom=1e-30)
+    ax.legend(loc="upper left", fontsize=13,
+              bbox_to_anchor=(0.01, 0.99), borderaxespad=0)
+    ax.grid(True, which="both", alpha=0.3)
+    plt.tight_layout()
+
+    fname = f"uber_{page_size}.png"
+    save_path = os.path.join(output_dir, fname)
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"\n  Analytical UBER plot  ->  {save_path}")
+
+
+def _plot_pareto(page_size, archs, results_map, mode, output_dir):
     """Pareto -- max tolerable SEU rate (UBER < UBER_REQ) vs code rate.
 
     Uses log-log linear interpolation to find the crossing point.
@@ -750,7 +845,7 @@ def _plot_pareto(page_size, archs, results_map, mode):
     crossing and placing them at the sweep edge would be misleading.
     """
     mode_label = "LEO burst model" if mode == "burst" else "random (no bursts)"
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax = plt.subplots(figsize=(11, 7))
 
     present_types = set()
     always_ok_labels = []
@@ -787,19 +882,19 @@ def _plot_pareto(page_size, archs, results_map, mode):
         color  = arch.style.get("color", "black")
 
         ax.semilogy(arch.rate, crossing,
-                    marker=marker, color=color, markersize=10, zorder=5)
+                    marker=marker, color=color, markersize=13, zorder=5)
         ax.annotate(
             arch.label.split("(")[0].strip(),
-            xy=(arch.rate, crossing), fontsize=7,
+            xy=(arch.rate, crossing), fontsize=10,
             textcoords="offset points", xytext=(8, 4),
-            arrowprops=dict(arrowstyle="-", color="gray", lw=0.5))
+            arrowprops=dict(arrowstyle="-", color="gray", lw=0.6))
 
     ax.set_xlabel("Code rate  (k / page_size)")
     ax.set_ylabel(
         f"Max tolerable SEU rate for UBER < {UBER_REQ:.0e}  [events/bit/s]")
     ax.set_title(
         f"ECC Pareto  --  page = {page_size} B, "
-        f"scrub = {SCRUB_INTERVAL} s  [{mode_label}]")
+        f"scrub = {SCRUB_INTERVAL} s")
     ax.grid(True, which="both", alpha=0.3)
 
     _legend_defs = [
@@ -809,16 +904,13 @@ def _plot_pareto(page_size, archs, results_map, mode):
     ]
     legend_elements = [
         Line2D([0], [0], marker=mk, color="w",
-               markerfacecolor=col, markersize=9, label=lbl)
+               markerfacecolor=col, markersize=11, label=lbl)
         for model, mk, col, lbl in _legend_defs
         if model in present_types
     ]
 
     # Collect footnote lines
     footnotes = []
-    sector_bits = (page_size // NUM_SECTORS) * 8
-    if sector_bits > 8191:
-        footnotes.append("BCH not plotted: sector exceeds GF(2^13) limit (8191 bits)")
     if always_ok_labels:
         names = ", ".join(always_ok_labels)
         footnotes.append(
@@ -827,7 +919,7 @@ def _plot_pareto(page_size, archs, results_map, mode):
     if footnotes:
         ax.text(
             0.98, 0.02, "\n".join(footnotes),
-            transform=ax.transAxes, fontsize=7, color="gray",
+            transform=ax.transAxes, fontsize=9, color="gray",
             ha="right", va="bottom",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
                       edgecolor="lightgray", alpha=0.8))
@@ -835,16 +927,16 @@ def _plot_pareto(page_size, archs, results_map, mode):
     if not present_types:
         ax.text(0.5, 0.5,
                 f"No architecture exceeds UBER_REQ = {UBER_REQ:.0e}\nwithin the simulated SEU-rate range.",
-                transform=ax.transAxes, fontsize=10, color="gray",
+                transform=ax.transAxes, fontsize=13, color="gray",
                 ha="center", va="center")
 
     if legend_elements:
-        ax.legend(handles=legend_elements, loc="lower left", fontsize=8)
+        ax.legend(handles=legend_elements, loc="lower left", fontsize=11)
     plt.tight_layout()
 
-    fname = f"pareto_{page_size}_{mode}.png"
-    save_path = os.path.join(OUTPUT_DIR, fname)
-    plt.savefig(save_path, dpi=150)
+    fname = f"pareto_{page_size}.png"
+    save_path = os.path.join(output_dir, fname)
+    plt.savefig(save_path, dpi=200)
     plt.close(fig)   # release figure; avoids Tk/Qt hang on plt.show()
     print(f"  Pareto plot ->  {save_path}")
 
@@ -958,8 +1050,9 @@ def run_all_analyses(page_sizes, mode):
                   "All worker tasks failed.")
             continue
 
-        _plot_uber(page_size, archs, results_map, mode)
-        _plot_pareto(page_size, archs, results_map, mode)
+        out_dir = _get_output_dir(mode)
+        _plot_uber(page_size, archs, results_map, mode, out_dir)
+        _plot_pareto(page_size, archs, results_map, mode, out_dir)
 
     # Close all matplotlib figures to prevent hanging on Windows
     plt.close('all')
@@ -980,6 +1073,11 @@ if __name__ == "__main__":
             "random (default) -- independent single-bit SEUs only.  "
             "burst -- LEO radiation model with 10:1 single-to-burst ratio."))
     parser.add_argument(
+        "--analytical-only", action="store_true",
+        help=(
+            "Skip Monte Carlo simulation entirely and plot only the "
+            "analytical (Poisson) UBER curves.  Runs instantly."))
+    parser.add_argument(
         "--mc-iter", type=int, default=None, metavar="N",
         help=(
             f"Monte Carlo iterations per (arch × SEU-rate) point "
@@ -995,9 +1093,19 @@ if __name__ == "__main__":
         print(f"  [mc-iter override] NUM_ITERS = {NUM_ITERS}  "
               f"(UBER floor ≈ {1/(NUM_ITERS*NUM_SECTORS):.2e})")
 
-    # All page sizes are processed in a single executor lifetime so the
-    # worker pool never goes idle between batches (avoids Windows hang).
-    run_all_analyses(PAGE_SIZES, args.mode)
+    if args.analytical_only:
+        print("  [analytical-only] Skipping Monte Carlo -- plotting Poisson models.")
+        out_dir = _get_output_dir("analytical")
+        for page_size in PAGE_SIZES:
+            archs = build_archs(page_size)
+            _plot_analytical_only(page_size, archs, args.mode, out_dir)
+            results_map = _analytical_results_map(archs)
+            _plot_pareto(page_size, archs, results_map, args.mode, out_dir)
+        plt.close("all")
+    else:
+        # All page sizes are processed in a single executor lifetime so the
+        # worker pool never goes idle between batches (avoids Windows hang).
+        run_all_analyses(PAGE_SIZES, args.mode)
     # plt.show() intentionally omitted: figures are saved as PNGs above.
     # plt.show() with Tk/Qt backends on Windows Store Python can hang.
     sys.exit(0)
