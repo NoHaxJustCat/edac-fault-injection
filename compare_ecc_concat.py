@@ -13,7 +13,7 @@ Usage:
     python compare_ecc_pagesizes.py --display bch     # 3 BCH-only codes
     python compare_ecc_pagesizes.py --display concat_rs   # 3 RS⊗RS-cross
     python compare_ecc_pagesizes.py --display concat_bch  # 3 BCH⊗RS-cross
-    python compare_ecc_pagesizes.py --mc-iter 500     # set MC iterations
+    python compare_ecc_pagesizes.py --mc-iter 500     # set MC 
 """
 
 import argparse
