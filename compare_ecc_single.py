@@ -733,7 +733,7 @@ def _uber_legend_name(arch):
     preserving richer labels for configuration tables and Pareto annotations.
     """
     if arch.arch_type == "rs":
-        return f"RS nsym_{arch.arch_params.get('nsym', '?')}"
+        return f"RS nsyms {arch.arch_params.get('nsym', '?')}"
     if arch.arch_type == "bch":
         ecc = arch.arch_params.get("ecc_bytes", "?")
         n_chunks = arch.arch_params.get("n_chunks", 1)
@@ -779,7 +779,7 @@ def _plot_uber(page_size, archs, results_map, mode, output_dir):
         if np.any(mask):
             ax.loglog(srs[mask], ubers[mask],
                       marker=".", markersize=5,
-                      label=f"MC  {legend_name}", **kw)
+                      label=f"{legend_name}", **kw)
 
         # Analytical overlay (thin dotted line, same colour)
         if arch.analytical_fn is not None:
@@ -789,7 +789,7 @@ def _plot_uber(page_size, archs, results_map, mode, output_dir):
                 ax.loglog(srs[mask_a], uber_a[mask_a],
                           linewidth=1.2, linestyle=":", alpha=0.5,
                           color=kw.get("color", "gray"),
-                          label=f"{legend_name}")
+                          label="_nolegend_")
 
     ax.axhline(UBER_REQ, color="red", linestyle="--", linewidth=1.8,
                alpha=0.8, label=f"UBER requirement ({UBER_REQ:.0e})")
