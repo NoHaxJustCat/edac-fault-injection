@@ -58,6 +58,14 @@ GF cycle-cost derivation
   │                              │ LUT footprint: ~32 KB of DTCM budget  │
   └──────────────────────────────┴────────────────────────────────────────┘
 
+  GF(2^13) LFSR step — fixed-constant multiply by α^j (syndrome / Chien):
+  ┌──────────────────────────────┬────────────────────────────────────────┐
+  │ All profiles (register-only) │ LSL r0, r0, #1       → 1 cyc         │
+  │                              │ TST r0, #(1<<13)     → 1 cyc         │
+  │                              │ IT NE; EOR r0, prim  → 1 cyc         │
+  │                              │ Total ≈ 3 cyc (no memory access)     │
+  └──────────────────────────────┴────────────────────────────────────────┘
+
   LDPC Gallager-A message update (dv=3, dc=30, binary messages):
   ┌──────────────────────────────┬────────────────────────────────────────┐
   │ DTCM                         │ BIT ops + graph accesses from DTCM    │
@@ -87,7 +95,7 @@ Usage
     python stm32h753_ecc_timing.py --freq 400e6           # lower clock
     python stm32h753_ecc_timing.py --memory-model dcache  # D-cache profile
     python stm32h753_ecc_timing.py --compare              # all 4 profiles side-by-side
-    python stm32h753_ecc_timing.py --plot                 # bar charts to images/
+    python stm32h753_ecc_timing.py --plot                 # bar charts to images/timing/
     python stm32h753_ecc_timing.py --breakdown            # per-operation cycle counts
     python stm32h753_ecc_timing.py --worst-case           # LDPC max iterations
 """
@@ -108,7 +116,9 @@ from ecc_timing import (
     PAGE_SIZES, NUM_SECTORS,
     RS_NSYMS, BCH_ECC_BYTES, BCH_GF_EXP,
     LDPC_DV, LDPC_DC, LDPC_MAX_ITER, LDPC_AVG_ITER,
+    NAND_DEVICES, nand_devices_for_page,
     build_all_timings, print_timing_table, plot_timing_bars,
+    plot_throughput_bars,
     print_operation_breakdown, EccTiming, InfeasibleEntry,
 )
 
@@ -136,8 +146,9 @@ GF13_LUT_TOTAL_BYTES  = GF13_LOG_TABLE_BYTES + GF13_EXP_TABLE_BYTES  # 32 KB
 #  Each profile is a dict with keys:
 #    gf8_mul     : cycles per GF(2^8)  multiply (log/antilog LUT)
 #    gf8_add     : cycles per GF(2^8)  addition (XOR)
-#    gf13_mul    : cycles per GF(2^13) multiply
+#    gf13_mul    : cycles per GF(2^13) multiply (arbitrary operands)
 #    gf13_add    : cycles per GF(2^13) addition (XOR)
+#    gf13_lfsr   : cycles per GF(2^13) fixed-constant multiply (LFSR step)
 #    ldpc_msg    : cycles per Gallager-A message update
 #    gf13_lut    : bool — True if GF(2^13) also uses LUT (not SW emulation)
 #    description : human-readable summary
@@ -148,7 +159,9 @@ PROFILES = {
         "gf8_add":  1,
         "gf13_mul": 60,
         "gf13_add": 1,
+        "gf13_lfsr": 3,
         "ldpc_msg": 3,
+        "ldpc_enc": 2,
         "gf13_lut": False,
         "short":    "DTCM",
         "description": (
@@ -164,7 +177,9 @@ PROFILES = {
         "gf8_add":  1,
         "gf13_mul": 7,
         "gf13_add": 1,
+        "gf13_lfsr": 3,
         "ldpc_msg": 3,
+        "ldpc_enc": 2,
         "gf13_lut": True,
         "short":    "DTCM + GF13-LUT",
         "description": (
@@ -179,7 +194,9 @@ PROFILES = {
         "gf8_add":  1,
         "gf13_mul": 65,
         "gf13_add": 1,
+        "gf13_lfsr": 3,
         "ldpc_msg": 4,
+        "ldpc_enc": 3,
         "gf13_lut": False,
         "short":    "D-cache",
         "description": (
@@ -195,7 +212,9 @@ PROFILES = {
         "gf8_add":  1,
         "gf13_mul": 68,
         "gf13_add": 1,
+        "gf13_lfsr": 3,
         "ldpc_msg": 5,
+        "ldpc_enc": 3,
         "gf13_lut": False,
         "short":    "AXI SRAM (no cache)",
         "description": (
@@ -232,9 +251,11 @@ def apply_profile(name: str) -> dict:
     p = PROFILES[name]
     _base.C_GF8_MUL  = p["gf8_mul"]
     _base.C_GF8_ADD  = p["gf8_add"]
-    _base.C_GF13_MUL = p["gf13_mul"]
-    _base.C_GF13_ADD = p["gf13_add"]
-    _base.C_LDPC_MSG = p["ldpc_msg"]
+    _base.C_GF13_MUL  = p["gf13_mul"]
+    _base.C_GF13_ADD  = p["gf13_add"]
+    _base.C_GF13_LFSR = p["gf13_lfsr"]
+    _base.C_LDPC_MSG      = p["ldpc_msg"]
+    _base.C_LDPC_ENC_EDGE = p["ldpc_enc"]
     return p
 
 
@@ -263,6 +284,7 @@ def print_mcu_header(freq_hz: float, profile_name: str):
           f"{'log/antilog LUT multiply' if p['gf13_lut'] else 'SW shift-XOR multiply (no CLMUL)'}")
     print(f"    C_GF13_ADD  = {p['gf13_add']:3d} cyc   GF(2^13) addition (XOR)")
     print(f"    C_LDPC_MSG  = {p['ldpc_msg']:3d} cyc   Gallager-A message update")
+    print(f"    C_LDPC_ENC  = {p['ldpc_enc']:3d} cyc   LDPC encode per-edge XOR")
     print()
 
 
@@ -346,7 +368,7 @@ def compare_all_profiles(freq_hz: float, page_size: int, worst_case: bool):
     def _cell_thr(t):
         if t is None or isinstance(t, InfeasibleEntry):
             return f"  {'N/A':>14}   "
-        return f"  {t.dec_throughput_mbps(freq_hz):>13.3f} M/s"
+        return f"  {t.dec_throughput_mbits(freq_hz):>11.2f} Mbit/s"
 
     # ── Encode latency ──────────────────────────────────────────────────────
     print(f"  {'Encode latency (µs)'}")    
@@ -380,7 +402,7 @@ def compare_all_profiles(freq_hz: float, page_size: int, worst_case: bool):
     print()
 
     # ── Decode throughput ───────────────────────────────────────────────────
-    print(f"  {'Decode throughput (MB/s)'}")
+    print(f"  {'Decode throughput (Mbit/s, ECC-only)'}")
     print(f"  {'Architecture':<26}" + hdr_cols)
     print(sep_cols)
     for lbl in all_labels:
@@ -396,7 +418,7 @@ def compare_all_profiles(freq_hz: float, page_size: int, worst_case: bool):
 
 
 def plot_profile_comparison(freq_hz: float, page_size: int,
-                             worst_case: bool, output_dir: str = "images"):
+                             worst_case: bool, output_dir: str = "images/timing"):
     """Side-by-side grouped bar chart: encode and decode latency per architecture,
     one bar group per ECC scheme, one bar colour per memory profile.
     Infeasible configurations are shown as hatched N/A stubs."""
@@ -543,7 +565,7 @@ def main():
     )
     parser.add_argument(
         "--plot", action="store_true",
-        help="Generate bar-chart PNGs in the images/ directory. "
+        help="Generate bar-chart PNGs in the images/timing/ directory. "
              "With --compare, also produces a cross-profile comparison chart.",
     )
     parser.add_argument(
@@ -616,7 +638,8 @@ def main():
         print("  Generating bar charts …")
         label_suffix = f"stm32h753_{args.memory_model}"
         # Temporarily redirect output dir naming
-        plot_timing_bars(all_timings, freq, wc, output_dir="images")
+        plot_timing_bars(all_timings, freq, wc, output_dir="images/timing")
+        plot_throughput_bars(all_timings, freq, wc, output_dir="images/timing")
 
     # Parameter summary
     print("  STM32H753 model parameters")
@@ -628,6 +651,7 @@ def main():
     print(f"  C_GF13_MUL     = {p['gf13_mul']:3d} cyc  ({gf13_note})")
     print(f"  C_GF13_ADD     = {p['gf13_add']:3d} cyc")
     print(f"  C_LDPC_MSG     = {p['ldpc_msg']:3d} cyc")
+    print(f"  C_LDPC_ENC     = {p['ldpc_enc']:3d} cyc")
     print(f"  LDPC iters     = "
           f"{LDPC_MAX_ITER if wc else LDPC_AVG_ITER:3d}  "
           f"({'worst-case' if wc else 'average'})")

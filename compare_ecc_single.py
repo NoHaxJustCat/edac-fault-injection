@@ -230,7 +230,7 @@ class Arch:
 #  ARCHITECTURE BUILDERS
 # ===========================================================
 
-_RS_COLORS  = [TOL_COLORS["blue"], TOL_COLORS["cyan"], "#88CCEE"]
+_RS_COLORS  = [TOL_COLORS["blue"], TOL_COLORS["cyan"]]
 _BCH_COLORS = [TOL_COLORS["green"], TOL_COLORS["yellow"], "#BBCC33"]
 
 
@@ -317,9 +317,8 @@ def _make_bch_arch(ecc_bytes, page_size, color):
         p_chunk_fail = uber_bch_only(r, bch_t, chunk_bits)
         return 1.0 - (1.0 - p_chunk_fail) ** _nc
 
-    chunk_tag = f" ×{n_chunks}cw" if n_chunks > 1 else ""
     return Arch(
-        label=f"BCH {ecc_bytes}B (t={bch_t}){chunk_tag}",
+        label=f"BCH {ecc_bytes}B (t={bch_t})",
         k=k, page_size=page_size,
         arch_type="bch",
         arch_params=dict(ecc_bytes=ecc_bytes, page_size=page_size,
@@ -373,15 +372,13 @@ def _make_ldpc_arch(page_size):
 def build_archs(page_size):
     """Return all Arch instances for the given page size.
 
-    Builds three RS-only (nsym in {8, 16, 24}), up to three BCH-only
+    Builds two RS-only (nsym in {8, 16}), up to three BCH-only
     (ecc_bytes in {13, 22, 31}), and one LDPC threshold architecture.
     BCH configs that exceed the GF(2^13) block size are silently skipped.
     """
     archs = []
 
-    for nsym, color in zip([8, 16, 24], _RS_COLORS):
-        if nsym == 24 and page_size != 4224:
-            continue   # RS nsym=24 excluded for non-standard page sizes
+    for nsym, color in zip([8, 16], _RS_COLORS):
         try:
             archs.append(_make_rs_arch(nsym, page_size, color))
         except ValueError:
@@ -729,6 +726,24 @@ def run_analysis(page_size, mode, pool=None):
 _MARKERS = {"rs": "^", "bch": "s", "ldpc": "D"}
 
 
+def _uber_legend_name(arch):
+    """Return concise code name for UBER legends.
+
+    Keeps UBER legends short and stable (no t-values or code rate), while
+    preserving richer labels for configuration tables and Pareto annotations.
+    """
+    if arch.arch_type == "rs":
+        return f"RS nsym_{arch.arch_params.get('nsym', '?')}"
+    if arch.arch_type == "bch":
+        ecc = arch.arch_params.get("ecc_bytes", "?")
+        n_chunks = arch.arch_params.get("n_chunks", 1)
+        suffix = f"_x{n_chunks}cw" if n_chunks > 1 else ""
+        return f"BCH {ecc}B{suffix}"
+    if arch.arch_type == "ldpc":
+        return "LDPC"
+    return arch.label.split("(")[0].strip()
+
+
 def _analytical_results_map(archs):
     """Build a results_map from analytical functions (no MC needed)."""
     results = {}
@@ -757,13 +772,14 @@ def _plot_uber(page_size, archs, results_map, mode, output_dir):
             continue  # Skip if no results for this architecture
         ubers = np.array([results_map[ai][s] for s in srs])
         mask  = ubers > uber_floor   # clip at MC resolution floor
+        legend_name = _uber_legend_name(arch)
         kw    = dict(arch.style)
 
         # MC curve
         if np.any(mask):
             ax.loglog(srs[mask], ubers[mask],
                       marker=".", markersize=5,
-                      label=f"{arch.label}  (R={arch.rate:.3f})", **kw)
+                      label=f"MC  {legend_name}", **kw)
 
         # Analytical overlay (thin dotted line, same colour)
         if arch.analytical_fn is not None:
@@ -772,14 +788,15 @@ def _plot_uber(page_size, archs, results_map, mode, output_dir):
             if np.any(mask_a):
                 ax.loglog(srs[mask_a], uber_a[mask_a],
                           linewidth=1.2, linestyle=":", alpha=0.5,
-                          color=kw.get("color", "gray"))
+                          color=kw.get("color", "gray"),
+                          label=f"{legend_name}")
 
     ax.axhline(UBER_REQ, color="red", linestyle="--", linewidth=1.8,
                alpha=0.8, label=f"UBER requirement ({UBER_REQ:.0e})")
 
     ax.axhline(uber_floor, color="#888888", linestyle=":", linewidth=1.4,
                alpha=0.9,
-               label=f"MC floor  (1/({NUM_ITERS}×{NUM_SECTORS}) = {uber_floor:.2e})")
+               label=f"MC floor")
 
     ax.set_xlabel("SEU rate  [events / bit / s]")
     ax.set_ylabel("UBER  (Monte Carlo)")
@@ -812,11 +829,12 @@ def _plot_analytical_only(page_size, archs, mode, output_dir):
         if not np.any(mask):
             continue
         kw = dict(arch.style)
+        legend_name = _uber_legend_name(arch)
         ax.loglog(SEU_RATE_SWEEP[mask], uber_a[mask],
-                  label=f"{arch.label}  (R={arch.rate:.3f})", **kw)
+                  label=f"{legend_name}", **kw)
 
     ax.axhline(UBER_REQ, color="red", linestyle="--", linewidth=1.8,
-               alpha=0.8, label=f"UBER requirement ({UBER_REQ:.0e})")
+               alpha=0.8, label=f"UBER RQT")
 
     ax.set_xlabel("SEU rate  [events / bit / s]")
     ax.set_ylabel("UBER  (analytical)")

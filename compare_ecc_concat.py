@@ -326,8 +326,8 @@ def run_analysis(page_size, display=None, n_iter=MC_ITERATIONS, seed=MC_SEED,
 
     # ── RS-only (3 configs) ───────────────────────────────
     if display in (None, 'rs', 'simple'):
-        _rs_cols = [_tol['blue'], _tol['cyan'], '#88CCEE']
-        for nsym, col in zip([8, 16, 24], _rs_cols):
+        _rs_cols = [_tol['blue'], _tol['cyan']]
+        for nsym, col in zip([8, 16], _rs_cols):
             rs_t = nsym // 2
             try:
                 k_rs = compute_data_bytes(page_size, NUM_SECTORS, rs_nsyms=[nsym])
@@ -490,15 +490,29 @@ def run_analysis(page_size, display=None, n_iter=MC_ITERATIONS, seed=MC_SEED,
     # ══════════════════════════════════════════════════════
     #  PLOT 1 — UBER curves
     # ══════════════════════════════════════════════════════
+    def _uber_legend_name(cfg):
+        """Compact code name for UBER legends (no t-values/rates)."""
+        lbl = cfg["label"]
+        if lbl.startswith("RS nsym="):
+            nsym = lbl.split("RS nsym=")[-1].split()[0].split("(")[0]
+            return f"RS nsym_{nsym}"
+        if lbl.startswith("BCH "):
+            token = lbl.split()[1] if len(lbl.split()) > 1 else "?"
+            return f"BCH {token}"
+        if lbl.startswith("LDPC"):
+            return "LDPC"
+        return lbl.split("(")[0].strip()
+
     fig, ax = plt.subplots(figsize=(6, 3))
     for c in configs:
         uber = results[c["label"]]
         mask = uber > 0
         kw   = dict(c.get("style", {}))
+        legend_name = _uber_legend_name(c)
         if np.any(mask):
             ax.loglog(SEU_RATE_SWEEP[mask], uber[mask],
                       marker='.', markersize=3,
-                      label=f"{c['label']}  (page={page_size}B, rate={c['rate']:.3f})", **kw)
+                      label=f"MC  {legend_name}", **kw)
         # Analytical overlay
         if c["label"] in analytical_results:
             uber_a = analytical_results[c["label"]]
@@ -506,7 +520,7 @@ def run_analysis(page_size, display=None, n_iter=MC_ITERATIONS, seed=MC_SEED,
             if np.any(mask_a):
                 ax.loglog(SEU_RATE_SWEEP[mask_a], uber_a[mask_a],
                           linewidth=0.8, linestyle=':', color=kw.get('color', 'gray'),
-                          alpha=0.5)
+                          alpha=0.5, label=f"Analytical  {legend_name}")
 
     ax.axhline(UBER_REQ, color='red', linestyle='--', linewidth=1.2, alpha=0.8,
                label='UBER requirement (1e-12)')

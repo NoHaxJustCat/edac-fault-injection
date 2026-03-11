@@ -6,8 +6,10 @@ compare_ecc_burst_pagesizes.py, given the clock frequency of the host MCU.
 
 ECC architectures analysed
 --------------------------
-  RS-only    : nsym ∈ {8, 16, 24}, GF(2^8), sector-wise (same as other scripts)
-  BCH-only   : ecc_bytes ∈ {13, 22, 31}, GF(2^13), sector-wise
+  RS-only    : nsym ∈ {8, 16}, GF(2^8), sector-wise (same as other scripts)
+  BCH-only   : ecc_bytes ∈ {13, 22, 31}, GF(2^13), sector-wise (auto-chunked
+               into ×N sub-codewords when the sector exceeds the 1023 B / 8191-bit
+               GF(2^13) codeword limit, matching compare_ecc_single.py)
   LDPC       : Gallager-A, dv=3, dc=30, page-wide (threshold model)
 
 Timing model
@@ -24,7 +26,9 @@ using precomputed lookup tables (GF(2^8)) or software CLMUL emulation
   C_GF8_ADD          1    Cycles per GF(2^8)  addition (XOR)
   C_GF13_MUL        25    Cycles per GF(2^13) multiply (soft CLMUL emu)
   C_GF13_ADD         1    Cycles per GF(2^13) addition (XOR)
+  C_GF13_LFSR        3    Cycles per GF(2^13) LFSR step (fixed α^j multiply)
   C_LDPC_MSG         4    Cycles per LDPC msg-passing update
+  C_LDPC_ENC_EDGE   2    Cycles per sparse-matrix XOR edge (LDPC encode)
   LDPC_MAX_ITER     50    Maximum Gallager-A decoder iterations
   LDPC_AVG_ITER     15    Average Gallager-A iterations (benign case)
 
@@ -41,26 +45,29 @@ Reed-Solomon decoding model (per sector, one codeword chunk):
   cycles_dec  ≈  n_sector × 3t × C_GF8_MUL  +  3t² × C_GF8_MUL
   where n_sector = encoded bytes per sector, t = nsym // 2.
 
-BCH encoding model (per sector):
+BCH encoding model (per sector, or per chunk when chunked):
   Systematic LFSR division of data polynomial by the generator.  Processing
   one bit at a time with t feedback taps (degree-2t generator):
   cycles_enc  =  k_sector × 8 × t × C_GF2_BIT
   where C_GF2_BIT ≈ 1 (single boolean XOR per feedback tap per bit).
+  For chunked sectors (n_chunks > 1): total = n_chunks × cycles_enc_per_chunk.
 
-BCH decoding model (per sector):
-  1. Syndrome     : n_sector_bits × 2t × C_GF13_MUL/m   (GF(2^m) Horner)
-  2. BM algorithm : 2t² × C_GF13_MUL
-  3. Chien search : n_sector_bits × t × C_GF13_MUL/m
+BCH decoding model (per sector, or per chunk when chunked):
+  1. Syndrome     : n_sector_bits × 2t × C_GF13_LFSR     (LFSR shift per syndrome register)
+  2. BM algorithm : n_chunks × 2t² × C_GF13_MUL          (arbitrary GF(2^m) multiplies)
+  3. Chien search : n_sector_bits × t × C_GF13_LFSR      (fixed α^j update per coefficient)
   4. Bit correction: t × C_GF13_ADD
-  cycles_dec  ≈  n_sector_bits × 3t × (C_GF13_MUL / m)  +  2t² × C_GF13_MUL
-  where m = BCH_GF_EXP = 13.
+  cycles_dec  ≈  n_sector_bits × 3t × C_GF13_LFSR  +  n_chunks × 2t² × C_GF13_MUL
+  where m = BCH_GF_EXP = 13.  C_GF13_LFSR models a fixed-constant multiply
+  by α^j implemented as a register-only shift+conditional-XOR (no memory access),
+  which is much cheaper than an arbitrary GF(2^m) multiply (C_GF13_MUL).
 
 LDPC (Gallager-A, dv=3, dc=30, page-wide) model:
   Each iteration: every variable node sends dv messages to check nodes
                   every check node  sends dc messages to variable nodes.
   n_vn = page_bits, n_cn ≈ page_bits × (dv/dc)
   messages_per_iter = n_vn × dv  +  n_cn × dc  ≈  n_vn × 2dv
-  cycles_enc  =  page_bits × dv × C_LDPC_MSG   (single-pass parity generation)
+  cycles_enc  =  page_bits × dv × C_LDPC_ENC_EDGE  (sparse parity-check generation)
   cycles_dec  =  iters × page_bits × 2dv × C_LDPC_MSG
 
 Usage
@@ -89,10 +96,12 @@ C_GF8_MUL   = 4    # GF(2^8)  multiply  (log/antilog LUT, 2 reads + 1 XOR)
 C_GF8_ADD   = 1    # GF(2^8)  add        (XOR)
 C_GF13_MUL  = 25   # GF(2^13) multiply  (software CLMUL emulation)
 C_GF13_ADD  = 1    # GF(2^13) add        (XOR)
+C_GF13_LFSR = 3    # GF(2^13) fixed-constant multiply (LFSR shift+XOR, register-only)
 BCH_GF_EXP  = 13   # BCH field exponent (bchlib uses GF(2^13))
 
-C_LDPC_MSG     = 4   # cycles per Gallager-A message update
-LDPC_MAX_ITER  = 50  # worst-case iterations
+C_LDPC_MSG      = 4   # cycles per Gallager-A message update
+C_LDPC_ENC_EDGE = 2   # cycles per sparse-matrix XOR edge (LDPC systematic encode)
+LDPC_MAX_ITER   = 50  # worst-case iterations
 LDPC_AVG_ITER  = 15  # average iterations (typical benign channel)
 
 # ---------------------------------------------------------------------------
@@ -101,11 +110,44 @@ LDPC_AVG_ITER  = 15  # average iterations (typical benign channel)
 PAGE_SIZES   = [4224, 8640]
 NUM_SECTORS  = 8
 
-RS_NSYMS     = [8, 16, 24]   
+RS_NSYMS     = [8, 16]   
 BCH_ECC_BYTES = [13, 22, 31]
 
 LDPC_DV = 3
 LDPC_DC = 30
+
+# ---------------------------------------------------------------------------
+#  NAND device profiles (page read / program / erase timings)
+# ---------------------------------------------------------------------------
+#  Each device maps page_size → {read_us, program_us, erase_us}.
+#  read_us / program_us are per-page; erase_us is per-block.
+NAND_DEVICES = {
+    "MT29F256G08": {
+        "desc": "MT29F256G08AUCABPB-10ITZ:A",
+        "page_size": 8640,
+        "read_us":    35.0,
+        "program_us": 350.0,
+        "erase_us":   1500.0,
+    },
+    "MT29F512G08": {
+        "desc": "MT29F512G08CUAAAC5:A",
+        "page_size": 8640,
+        "read_us":    75.0,
+        "program_us": 1300.0,
+        "erase_us":   3800.0,
+    },
+    "3DFN128G08": {
+        "desc": "3DFN128G08US8761",
+        "page_size": 4224,
+        "read_us":    27.0,
+        "program_us": 230.0,
+        "erase_us":   700.0,
+    },
+}
+
+def nand_devices_for_page(page_size: int) -> list:
+    """Return list of NAND device keys whose page_size matches."""
+    return [k for k, v in NAND_DEVICES.items() if v["page_size"] == page_size]
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +200,9 @@ def rs_decode_cycles(n_sector: int, nsym: int) -> int:
     cyc_correct = t * C_GF8_ADD
     # Overhead / branch logic
     overhead = 200
+    # NOTE: This models the worst-case (errors present) path.  In the error-free
+    # case, all syndromes are zero and the decoder can early-exit after step 1,
+    # skipping BM, Chien, and Forney (saving ~60-80% of decode cycles at low BER).
     return int(cyc_syndrome + cyc_bm + cyc_chien + cyc_forney + cyc_correct + overhead)
 
 
@@ -188,9 +233,10 @@ def bch_decode_cycles(n_sector: int, k_sector: int, t: int) -> int:
     Pipeline: syndrome → Berlekamp-Massey → Chien search → bit correction.
     BCH operates over GF(2^m), m = BCH_GF_EXP = 13.
 
-    Each GF(2^m) operation on an MCU costs ~C_GF13_MUL / m cycles per
-    single-dimensional bit step (bit-serial Chien/syndrome steps have
-    cost proportional to 1 XOR per bit plane, not the full field mult).
+    Syndrome computation and Chien search use fixed-constant multiplies
+    by powers of α (LFSR shift + conditional XOR), costing C_GF13_LFSR
+    per step — a register-only operation independent of memory placement.
+    Only Berlekamp-Massey requires full arbitrary GF(2^m) multiplies.
 
     Args:
         n_sector : total encoded bytes per sector (data + parity)
@@ -201,16 +247,14 @@ def bch_decode_cycles(n_sector: int, k_sector: int, t: int) -> int:
         Estimated clock cycles to decode one sector (error-present path).
     """
     n_bits = n_sector * 8
-    m = BCH_GF_EXP
-    # 1. Syndrome: n_bits single-bit LFSR steps, 2t syndrome registers,
-    #    each step costs 1 XOR per register (m-bit) = m XORs per step per register
-    # Simplified: n_bits × 2t × m / m = n_bits × 2t (one GF(2) op per bit per register)
-    cyc_syndrome = n_bits * 2 * t * C_GF13_ADD
+    # 1. Syndrome: n_bits LFSR steps, 2t syndrome registers.
+    #    Each step is a fixed multiply by α^j (shift + conditional XOR).
+    cyc_syndrome = n_bits * 2 * t * C_GF13_LFSR
     # 2. BM over GF(2^m): ~2t^2 full GF(2^m) multiplications
     cyc_bm = 2 * t * t * (C_GF13_MUL + C_GF13_ADD)
-    # 3. Chien search: n_bits evaluation points × t GF(2^m) multiplications
-    #    (Horner for degree-t error-locator polynomial at each bit position)
-    cyc_chien = n_bits * t * C_GF13_MUL
+    # 3. Chien search: incremental α^j update per coefficient per position.
+    #    Each step is a fixed-constant multiply (LFSR shift), not a full GF mult.
+    cyc_chien = n_bits * t * C_GF13_LFSR
     # 4. Bit correction: t XOR operations (trivial)
     cyc_correct = t * C_GF13_ADD
     # Overhead
@@ -232,8 +276,11 @@ def ldpc_encode_cycles(page_size: int) -> int:
         Estimated clock cycles to encode one page.
     """
     page_bits = page_size * 8
-    # Each variable node contributes to dv check nodes (one XOR per edge)
-    cycles = page_bits * LDPC_DV * C_LDPC_MSG
+    # Systematic encode via sparse parity-check matrix: each variable node
+    # contributes to dv parity equations (one XOR + sparse index access per edge).
+    # Uses C_LDPC_ENC_EDGE (not C_LDPC_MSG) since encoding is a single-pass
+    # sparse matrix-vector product, not iterative message-passing.
+    cycles = page_bits * LDPC_DV * C_LDPC_ENC_EDGE
     cycles += 300  # overhead
     return int(cycles)
 
@@ -271,7 +318,8 @@ class EccTiming:
     def __init__(self, label: str, code_type: str, page_size: int,
                  k: int, n: int, redundancy_pct: float,
                  enc_cycles_total: int, dec_cycles_total: int,
-                 enc_cycles_per_sector: int, dec_cycles_per_sector: int):
+                 enc_cycles_per_sector: int, dec_cycles_per_sector: int,
+                 n_chunks: int = 1):
         self.label              = label
         self.code_type          = code_type
         self.page_size          = page_size
@@ -282,6 +330,7 @@ class EccTiming:
         self.dec_cycles_total   = dec_cycles_total
         self.enc_cycles_sector  = enc_cycles_per_sector
         self.dec_cycles_sector  = dec_cycles_per_sector
+        self.n_chunks           = n_chunks
 
     def enc_time_us(self, freq_hz: float) -> float:
         return self.enc_cycles_total / freq_hz * 1e6
@@ -289,19 +338,31 @@ class EccTiming:
     def dec_time_us(self, freq_hz: float) -> float:
         return self.dec_cycles_total / freq_hz * 1e6
 
-    def enc_throughput_mbps(self, freq_hz: float) -> float:
-        """Effective write throughput (data bytes / encoding time)."""
-        t_s = self.enc_cycles_total / freq_hz
-        if t_s <= 0:
-            return float("inf")
-        return (self.k / t_s) / 1e6
+    def enc_throughput_mbits(self, freq_hz: float,
+                              nand_program_us: float = 0.0) -> float:
+        """Effective write throughput in Mbit/s.
 
-    def dec_throughput_mbps(self, freq_hz: float) -> float:
-        """Effective read throughput (data bytes / decoding time)."""
-        t_s = self.dec_cycles_total / freq_hz
-        if t_s <= 0:
+        Throughput = k * 8 / (t_ecc_encode + t_nand_program).
+        """
+        t_ecc_s  = self.enc_cycles_total / freq_hz
+        t_nand_s = nand_program_us * 1e-6
+        t_total  = t_ecc_s + t_nand_s
+        if t_total <= 0:
             return float("inf")
-        return (self.k / t_s) / 1e6
+        return (self.k * 8 / t_total) / 1e6
+
+    def dec_throughput_mbits(self, freq_hz: float,
+                              nand_read_us: float = 0.0) -> float:
+        """Effective read throughput in Mbit/s.
+
+        Throughput = k * 8 / (t_ecc_decode + t_nand_read).
+        """
+        t_ecc_s  = self.dec_cycles_total / freq_hz
+        t_nand_s = nand_read_us * 1e-6
+        t_total  = t_ecc_s + t_nand_s
+        if t_total <= 0:
+            return float("inf")
+        return (self.k * 8 / t_total) / 1e6
 
 
 class InfeasibleEntry:
@@ -367,7 +428,13 @@ def build_rs_timing(nsym: int, page_size: int):
 
 
 def build_bch_timing(ecc_bytes: int, page_size: int):
-    """Compute BCH-only timing for the given page size and ecc_bytes."""
+    """Compute BCH-only timing for the given page size and ecc_bytes.
+
+    When the sector size exceeds the GF(2^13) codeword limit (8191 bits /
+    1023 bytes), the sector is automatically split into the minimum number
+    of equal-sized sub-sector chunks, each independently BCH-encoded.
+    This mirrors the chunking strategy in compare_ecc_single.py.
+    """
     t_bits = BCH_BITS_FROM_ECC.get(ecc_bytes)
     label  = f"BCH {ecc_bytes}B (t={t_bits})" if t_bits else f"BCH {ecc_bytes}B"
     try:
@@ -376,37 +443,47 @@ def build_bch_timing(ecc_bytes: int, page_size: int):
         return InfeasibleEntry(label=label, code_type="bch",
                                page_size=page_size, reason=str(exc))
 
-    label        = f"BCH {ecc_bytes}B (t={bch_obj.t})"
-    sector_bytes = page_size // NUM_SECTORS
-    data_len     = sector_bytes - bch_obj.ecc_bytes
-    max_data_bytes = (8191 - bch_obj.ecc_bits) // 8
+    label              = f"BCH {ecc_bytes}B (t={bch_obj.t})"
+    sector_bytes       = page_size // NUM_SECTORS
+    max_codeword_bytes = 8191 // 8           # = 1023 B
+    max_data_bytes     = (8191 - bch_obj.ecc_bits) // 8
 
-    if data_len <= 0:
-        return InfeasibleEntry(
-            label=label, code_type="bch", page_size=page_size,
-            reason=f"sector {sector_bytes} B ≤ BCH parity {bch_obj.ecc_bytes} B — no room for data",
-        )
-    if data_len > max_data_bytes:
-        sector_bits = sector_bytes * 8
-        gf_max      = 2 ** BCH_GF_EXP - 1
+    # Find the smallest n_chunks so every chunk fits within the GF(2^13) limit.
+    # n_chunks must also divide sector_bytes evenly for equal-sized sub-blocks.
+    n_chunks = math.ceil(sector_bytes / max_codeword_bytes)
+    while sector_bytes % n_chunks != 0:
+        n_chunks += 1
+
+    chunk_encoded_bytes = sector_bytes // n_chunks
+    chunk_data_bytes    = chunk_encoded_bytes - bch_obj.ecc_bytes
+
+    if chunk_data_bytes <= 0:
         return InfeasibleEntry(
             label=label, code_type="bch", page_size=page_size,
             reason=(
-                f"sector {sector_bytes} B = {sector_bits} bits "
+                f"chunk {chunk_encoded_bytes} B ≤ BCH parity "
+                f"{bch_obj.ecc_bytes} B — no room for data"
+            ),
+        )
+    if chunk_data_bytes > max_data_bytes:
+        chunk_bits = chunk_encoded_bytes * 8
+        gf_max     = 2 ** BCH_GF_EXP - 1
+        return InfeasibleEntry(
+            label=label, code_type="bch", page_size=page_size,
+            reason=(
+                f"chunk {chunk_encoded_bytes} B = {chunk_bits} bits "
                 f"> GF(2^{BCH_GF_EXP}) max codeword {gf_max} bits"
             ),
         )
 
-    t        = bch_obj.t
-    k        = data_len * NUM_SECTORS
-    n_sector = sector_bytes
+    t         = bch_obj.t
+    k         = chunk_data_bytes * n_chunks * NUM_SECTORS
 
-    enc_per_sector = bch_encode_cycles(data_len, t)
-    dec_per_sector = bch_decode_cycles(n_sector, data_len, t)
+    enc_per_sector = n_chunks * bch_encode_cycles(chunk_data_bytes, t)
+    dec_per_sector = n_chunks * bch_decode_cycles(chunk_encoded_bytes, chunk_data_bytes, t)
 
-    enc_total = enc_per_sector * NUM_SECTORS
-    dec_total = dec_per_sector * NUM_SECTORS
-
+    enc_total  = enc_per_sector * NUM_SECTORS
+    dec_total  = dec_per_sector * NUM_SECTORS
     redundancy = (page_size - k) / page_size * 100.0
 
     return EccTiming(
@@ -477,12 +554,12 @@ COL_W = {
     "dec_cyc":  12,
     "enc_us":   10,
     "dec_us":   10,
-    "enc_mbps": 10,
-    "dec_mbps": 10,
+    "enc_mbits": 12,
+    "dec_mbits": 12,
 }
 
 
-def _row(label, k, red, enc_cyc, dec_cyc, enc_us, dec_us, enc_mbps, dec_mbps):
+def _row(label, k, red, enc_cyc, dec_cyc, enc_us, dec_us, enc_mbits, dec_mbits):
     return (
         f"  {label:<{COL_W['label']}}"
         f"  {k:>{COL_W['k']}}"
@@ -491,8 +568,8 @@ def _row(label, k, red, enc_cyc, dec_cyc, enc_us, dec_us, enc_mbps, dec_mbps):
         f"  {dec_cyc:>{COL_W['dec_cyc']}}"
         f"  {enc_us:>{COL_W['enc_us']}}"
         f"  {dec_us:>{COL_W['dec_us']}}"
-        f"  {enc_mbps:>{COL_W['enc_mbps']}}"
-        f"  {dec_mbps:>{COL_W['dec_mbps']}}"
+        f"  {enc_mbits:>{COL_W['enc_mbits']}}"
+        f"  {dec_mbits:>{COL_W['dec_mbits']}}"
     )
 
 
@@ -513,12 +590,23 @@ def _row_infeasible(label: str, reason: str) -> str:
     )
 
 
-def print_timing_table(timings: list, freq_hz: float, page_size: int):
+def print_timing_table(timings: list, freq_hz: float, page_size: int,
+                       nand_key: str = None):
+    """Print the tabular timing summary.
+
+    If *nand_key* is given, throughput columns include the NAND read/program
+    latency in addition to the ECC compute time.
+    """
+    nand = NAND_DEVICES.get(nand_key) if nand_key else None
+    read_us    = nand["read_us"]    if nand else 0.0
+    program_us = nand["program_us"] if nand else 0.0
+    thr_label  = "Mbit/s" if nand else "Mbit/s"
+
     header = _row(
         "Architecture", "k (B)", "Red. %",
         "Enc cycles", "Dec cycles",
         "Enc (µs)", "Dec (µs)",
-        "Enc MB/s", "Dec MB/s",
+        f"Enc {thr_label}", f"Dec {thr_label}",
     )
     sep = "  " + "-" * (len(header) - 2)
 
@@ -527,6 +615,13 @@ def print_timing_table(timings: list, freq_hz: float, page_size: int):
     print(f"  Page size : {page_size} B ({page_size // NUM_SECTORS} B/sector, "
           f"{NUM_SECTORS} sectors)")
     print(f"  MCU clock : {label_freq}")
+    if nand:
+        print(f"  NAND      : {nand['desc']}  "
+              f"(read={read_us} µs, program={program_us} µs, "
+              f"erase={nand['erase_us']} µs)")
+        print(f"  Throughput: k×8 / (t_ECC + t_NAND)  [Mbit/s]")
+    else:
+        print(f"  Throughput: k×8 / t_ECC  [Mbit/s, no NAND I/O]")
     print(f"  Dec model : worst-case (errors present) for RS/BCH")
     print()
     print(header)
@@ -547,8 +642,8 @@ def print_timing_table(timings: list, freq_hz: float, page_size: int):
                 f"{t.dec_cycles_total:,}",
                 f"{t.enc_time_us(freq_hz):.2f}",
                 f"{t.dec_time_us(freq_hz):.2f}",
-                f"{t.enc_throughput_mbps(freq_hz):.3f}",
-                f"{t.dec_throughput_mbps(freq_hz):.3f}",
+                f"{t.enc_throughput_mbits(freq_hz, program_us):.2f}",
+                f"{t.dec_throughput_mbits(freq_hz, read_us):.2f}",
             ))
     print(sep)
     print()
@@ -559,7 +654,7 @@ def print_timing_table(timings: list, freq_hz: float, page_size: int):
 # ---------------------------------------------------------------------------
 
 def plot_timing_bars(all_timings: dict, freq_hz: float,
-                     worst_case: bool, output_dir: str = "images"):
+                     worst_case: bool, output_dir: str = "images/timing"):
     """Generate encode / decode latency bar charts for all page sizes.
 
     Feasible entries are drawn as solid colour bars with value labels.
@@ -661,6 +756,123 @@ def plot_timing_bars(all_timings: dict, freq_hz: float,
         print(f"  Saved: {fname}")
 
 
+def plot_throughput_bars(all_timings: dict, freq_hz: float,
+                         worst_case: bool, output_dir: str = "images/timing"):
+    """Generate encode / decode throughput (Mbit/s) bar charts per NAND device.
+
+    For each page size, one chart is produced per matching NAND device.
+    Each chart has paired encode/decode bars per ECC architecture.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib as mpl
+        import matplotlib.patches as mpatches
+    except ImportError:
+        print("[warning] matplotlib not available — skipping throughput plot")
+        return
+
+    mpl.rcParams.update({
+        "font.family":    "serif",
+        "font.size":      9,
+        "axes.titlesize": 10,
+        "axes.labelsize": 9,
+        "legend.fontsize": 8,
+        "figure.dpi":     150,
+    })
+
+    label_freq = f"{freq_hz/1e6:.0f} MHz"
+    os.makedirs(output_dir, exist_ok=True)
+
+    for page_size, timings in all_timings.items():
+        nand_keys = nand_devices_for_page(page_size)
+        if not nand_keys:
+            continue
+        for nand_key in nand_keys:
+            nand = NAND_DEVICES[nand_key]
+            read_us    = nand["read_us"]
+            program_us = nand["program_us"]
+
+            labels = [t.label for t in timings]
+            x      = np.arange(len(labels))
+            w      = 0.38
+
+            feasible_idx   = [i for i, t in enumerate(timings)
+                              if not isinstance(t, InfeasibleEntry)]
+            infeasible_idx = [i for i, t in enumerate(timings)
+                              if isinstance(t, InfeasibleEntry)]
+
+            enc_thr = [timings[i].enc_throughput_mbits(freq_hz, program_us)
+                       for i in feasible_idx]
+            dec_thr = [timings[i].dec_throughput_mbits(freq_hz, read_us)
+                       for i in feasible_idx]
+
+            fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.1), 4.5))
+
+            bars_enc = ax.bar(x[feasible_idx] - w / 2, enc_thr, width=w,
+                              label="Write (enc + program)", color="#4477AA",
+                              alpha=0.85)
+            bars_dec = ax.bar(x[feasible_idx] + w / 2, dec_thr, width=w,
+                              label="Read (dec + page read)", color="#EE6677",
+                              alpha=0.85)
+
+            for bar, h in zip(bars_enc, enc_thr):
+                ax.text(bar.get_x() + bar.get_width() / 2, h * 1.01,
+                        f"{h:.1f}", ha="center", va="bottom", fontsize=7,
+                        color="#4477AA")
+            for bar, h in zip(bars_dec, dec_thr):
+                ax.text(bar.get_x() + bar.get_width() / 2, h * 1.01,
+                        f"{h:.1f}", ha="center", va="bottom", fontsize=7,
+                        color="#EE6677")
+
+            if infeasible_idx:
+                all_vals = enc_thr + dec_thr
+                y_max  = max(all_vals) if all_vals else 1.0
+                stub_h = y_max * 0.06
+                for i in infeasible_idx:
+                    for offset in (-w / 2, w / 2):
+                        ax.bar(x[i] + offset, stub_h, width=w,
+                               color="none", edgecolor="#888888",
+                               hatch="//", linewidth=0.8)
+                    ax.text(x[i], stub_h * 1.3, "N/A",
+                            ha="center", va="bottom", fontsize=7,
+                            color="#888888", style="italic")
+
+            iter_tag = "worst-case" if worst_case else "avg-iter"
+            ax.set_title(
+                f"Effective Throughput — {nand['desc']}\n"
+                f"{page_size} B page @ {label_freq}  "
+                f"(read={read_us} µs, prog={program_us} µs, "
+                f"{iter_tag} LDPC)",
+                pad=8,
+            )
+            ax.set_ylabel("Throughput (Mbit/s)")
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+
+            handles, _ = ax.get_legend_handles_labels()
+            if infeasible_idx:
+                handles.append(mpatches.Patch(
+                    facecolor="none", edgecolor="#888888",
+                    hatch="//", linewidth=0.8, label="N/A (infeasible)"))
+            ax.legend(handles=handles, framealpha=0.9)
+
+            all_vals = enc_thr + dec_thr
+            y_top = max(all_vals) * 1.15 if all_vals else 1.0
+            ax.set_ylim(0, y_top)
+            ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+            ax.set_axisbelow(True)
+
+            fig.tight_layout()
+            fname = os.path.join(
+                output_dir,
+                f"ecc_throughput_{nand_key}_{page_size}B_"
+                f"{int(freq_hz/1e6)}MHz.png",
+            )
+            fig.savefig(fname, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  Saved: {fname}")
+
+
 # ---------------------------------------------------------------------------
 #  Detailed per-operation breakdown
 # ---------------------------------------------------------------------------
@@ -698,25 +910,25 @@ def print_operation_breakdown(timings: list, freq_hz: float):
             ]
 
         elif arch.code_type == "bch":
-            # parse t from label
-            t_str  = arch.label.split("(t=")[1].rstrip(")")
-            t      = int(t_str)
-            ecc_b  = n_s - k_s
-            n_bits = n_s * 8
-            m      = BCH_GF_EXP
+            t_str    = arch.label.split("(t=")[1].split(")")[0]
+            t        = int(t_str)
+            n_chunks = arch.n_chunks
+            ecc_b    = n_s - k_s
+            n_bits   = n_s * 8
+            m        = BCH_GF_EXP
             lbl_enc = [
                 (f"LFSR steps (k_bits×t×C_add)",
                  k_s * 8 * t * C_GF8_ADD),
-                ("Output + overhead", 100),
+                ("Output + overhead", 100 * n_chunks),
             ]
             lbl_dec = [
-                (f"Syndrome (n_bits×2t×C_add)",
-                 n_bits * 2 * t * C_GF13_ADD),
-                (f"Berlekamp-Massey (2t²×(C_gf13_mul+add))",
-                 2 * t * t * (C_GF13_MUL + C_GF13_ADD)),
-                (f"Chien search (n_bits×t×C_gf13_mul)",
-                 n_bits * t * C_GF13_MUL),
-                ("Bit correction + overhead", t * C_GF13_ADD + 300),
+                (f"Syndrome (n_bits×2t×C_gf13_mul/m)",
+                 n_bits * 2 * t * (C_GF13_MUL / m)),
+                (f"Berlekamp-Massey ({n_chunks}×2t²×(C_gf13_mul+add))",
+                 n_chunks * 2 * t * t * (C_GF13_MUL + C_GF13_ADD)),
+                (f"Chien search (n_bits×t×C_gf13_mul/m)",
+                 n_bits * t * (C_GF13_MUL / m)),
+                ("Bit correction + overhead", t * C_GF13_ADD + 300 * n_chunks),
             ]
 
         else:  # ldpc
@@ -724,8 +936,8 @@ def print_operation_breakdown(timings: list, freq_hz: float):
             iter_str  = arch.label.split("=")[2].split()[0]
             n_iters   = int(iter_str)
             lbl_enc = [
-                (f"Parity generation (page_bits×dv×C_msg)",
-                 page_bits * LDPC_DV * C_LDPC_MSG),
+                (f"Parity generation (page_bits×dv×C_enc_edge)",
+                 page_bits * LDPC_DV * C_LDPC_ENC_EDGE),
                 ("Overhead", 300),
             ]
             lbl_dec = [
@@ -756,7 +968,7 @@ def print_operation_breakdown(timings: list, freq_hz: float):
 # ---------------------------------------------------------------------------
 
 def main():
-    global C_GF8_MUL, C_GF13_MUL, C_LDPC_MSG
+    global C_GF8_MUL, C_GF13_MUL, C_LDPC_MSG, C_LDPC_ENC_EDGE
 
     parser = argparse.ArgumentParser(
         description="Estimate ECC encode/decode latency for an MCU given its clock frequency.",
@@ -776,7 +988,7 @@ def main():
     )
     parser.add_argument(
         "--plot", action="store_true",
-        help="Generate bar-chart PNG(s) in the images/ directory.",
+        help="Generate bar-chart PNG(s) in the images/timing/ directory.",
     )
     parser.add_argument(
         "--worst-case", action="store_true",
@@ -802,17 +1014,52 @@ def main():
         metavar="CYC",
         help=f"Override LDPC message-update cycle cost (default {C_LDPC_MSG}).",
     )
+    parser.add_argument(
+        "--c-ldpc-enc-edge", type=int, default=C_LDPC_ENC_EDGE,
+        metavar="CYC",
+        help=f"Override LDPC encode per-edge cycle cost (default {C_LDPC_ENC_EDGE}).",
+    )
+    parser.add_argument(
+        "--nand", type=str, choices=list(NAND_DEVICES), default=None,
+        metavar="DEVICE",
+        help=(
+            "NAND device for throughput calculation. "
+            "Adds page-read/program latency to ECC time. "
+            f"Choices: {', '.join(NAND_DEVICES)}. "
+            "Default: none (ECC-only throughput)."
+        ),
+    )
 
     args = parser.parse_args()
 
     # Apply overrides to module-level constants
-    C_GF8_MUL   = args.c_gf8_mul
-    C_GF13_MUL  = args.c_gf13_mul
-    C_LDPC_MSG  = args.c_ldpc_msg
+    C_GF8_MUL       = args.c_gf8_mul
+    C_GF13_MUL      = args.c_gf13_mul
+    C_LDPC_MSG      = args.c_ldpc_msg
+    C_LDPC_ENC_EDGE = args.c_ldpc_enc_edge
 
     freq_hz    = args.freq
     worst_case = args.worst_case
+    nand_arg   = args.nand
     sizes      = [args.page] if args.page else PAGE_SIZES
+
+    # If a NAND device is specified, restrict page sizes to the matching one
+    if nand_arg:
+        nand_ps = NAND_DEVICES[nand_arg]["page_size"]
+        if args.page and args.page != nand_ps:
+            print(f"  ERROR: --nand {nand_arg} has page_size={nand_ps} B "
+                  f"but --page {args.page} was specified.")
+            sys.exit(1)
+        sizes = [nand_ps]
+
+    if freq_hz >= 400e6:
+        print()
+        print("  WARNING: Clock frequency >= 400 MHz suggests an STM32H7-class target.")
+        print("  The default GF cycle constants here are tuned for a generic Cortex-M4.")
+        print("  For STM32H753-specific memory hierarchy models (DTCM, D-cache, AXI SRAM),")
+        print("  use stm32h753_ecc_timing.py instead, or override constants with")
+        print("  --c-gf8-mul / --c-gf13-mul.")
+        print()
 
     freq_label = (f"{freq_hz/1e9:.3f} GHz" if freq_hz >= 1e9
                   else f"{freq_hz/1e6:.1f} MHz" if freq_hz >= 1e6
@@ -822,7 +1069,7 @@ def main():
     print("=" * 100)
     print(f"  ECC TIMING ESTIMATOR  ·  Clock: {freq_label}  ·  "
           f"GF8-mul={C_GF8_MUL} cyc  GF13-mul={C_GF13_MUL} cyc  "
-          f"LDPC-msg={C_LDPC_MSG} cyc")
+          f"LDPC-msg={C_LDPC_MSG} cyc  LDPC-enc={C_LDPC_ENC_EDGE} cyc")
     print("=" * 100)
     print()
     print("  NOTE: All cycle counts are order-of-magnitude estimates for a "
@@ -839,13 +1086,25 @@ def main():
     for page_size in sizes:
         timings = build_all_timings(page_size, worst_case=worst_case)
         all_timings[page_size] = timings
-        print_timing_table(timings, freq_hz, page_size)
+
+        if nand_arg:
+            # Single NAND device specified — one table with its timings
+            print_timing_table(timings, freq_hz, page_size, nand_key=nand_arg)
+        else:
+            # Print one table per matching NAND device, plus a bare ECC-only table
+            device_keys = nand_devices_for_page(page_size)
+            for nk in device_keys:
+                print_timing_table(timings, freq_hz, page_size, nand_key=nk)
+            if not device_keys:
+                print_timing_table(timings, freq_hz, page_size)
+
         if args.breakdown:
             print_operation_breakdown(timings, freq_hz)
 
     if args.plot:
         print("  Generating bar charts …")
         plot_timing_bars(all_timings, freq_hz, worst_case)
+        plot_throughput_bars(all_timings, freq_hz, worst_case)
 
     # Print model parameter summary
     print("  Model parameters")
@@ -855,6 +1114,7 @@ def main():
     print(f"  C_GF13_MUL  = {C_GF13_MUL:3d} cyc   (GF(2^13) multiply, soft CLMUL emulation)")
     print(f"  C_GF13_ADD  = {C_GF13_ADD:3d} cyc   (GF(2^13) add, XOR)")
     print(f"  C_LDPC_MSG  = {C_LDPC_MSG:3d} cyc   (Gallager-A message update)")
+    print(f"  C_LDPC_ENC  = {C_LDPC_ENC_EDGE:3d} cyc   (LDPC encode per-edge XOR)")
     print(f"  LDPC iters  = {LDPC_MAX_ITER if worst_case else LDPC_AVG_ITER:3d}        "
           f"({'worst-case' if worst_case else 'average'})")
     print(f"  NUM_SECTORS = {NUM_SECTORS:3d}")
