@@ -55,7 +55,7 @@ from utils import (
     encode_with_bch, decode_with_bch,
     encode_with_bch_chunked, decode_with_bch_chunked,
 )
-from monte_carlo import inject_errors_leo, inject_errors_leo_conditional, _POPCOUNT8
+from monte_carlo import inject_errors_leo, inject_errors_leo_conditional, _POPCOUNT8, _BURST_SEU_RATIO
 
 # ===========================================================
 #  OUTPUT DIRECTORY
@@ -98,7 +98,7 @@ UBER_REQ       = 1e-12
 #       NUM_ITERS ≥ 1 / (UBER_floor × NUM_SECTORS)
 #   e.g. 10⁻⁴ floor → ≥1 250 iters,  10⁻⁵ floor → ≥12 500 iters.
 #
-NUM_ITERS      = 10          # iterations per (architecture × SEU-rate point)
+NUM_ITERS      = 10         # iterations per (architecture × SEU-rate point)
                                # → floor ≈ 1.25×10⁻⁴  (smooth down to ~10⁻⁴)
 # Cap at 61: Python 3.13 on Windows enforces a strict 61-worker handle limit.
 _CPU_COUNT  = os.cpu_count() or 1
@@ -521,6 +521,8 @@ def _worker(task):
         # This eliminates zero-event iterations and greatly improves resolution
         # at low SEU rates where λ << 1 and most Poisson draws would be zero.
         lam_page = seu_rate * (page_size * 8) * scrub_interval
+        if mode == "burst":
+            lam_page *= (1.0 + _BURST_SEU_RATIO)  # burst events add 1/10 of single-bit SEU rate
         p_flip = 1.0 - exp(-lam_page) if lam_page < 700.0 else 1.0
 
         inject = (_inject_burst_conditional if mode == "burst"

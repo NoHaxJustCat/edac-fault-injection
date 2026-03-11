@@ -513,7 +513,7 @@ def build_ldpc_timing(page_size: int, worst_case: bool = False) -> EccTiming:
     iter_label = "max" if worst_case else "avg"
 
     return EccTiming(
-        label=f"LDPC dv={dv},dc={dc} ({iter_label}={n_iters} iter)",
+        label=f"LDPC dv={dv},dc={dc}",
         code_type="ldpc",
         page_size=page_size,
         k=k, n=page_size,
@@ -723,8 +723,7 @@ def plot_timing_bars(all_timings: dict, freq_hz: float,
 
         iter_tag = "worst-case" if worst_case else "avg-iter"
         ax.set_title(
-            f"ECC Encoding / Decoding Latency — {page_size} B page @ {label_freq}\n"
-            f"(software model, {iter_tag} LDPC)",
+            f"ECC Encoding / Decoding Latency — {page_size} B page @ {label_freq}\n",
             pad=8,
         )
         ax.set_ylabel("Latency (µs)")

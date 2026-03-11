@@ -8,6 +8,8 @@ simulation interfaces.
 LEO Radiation Model Parameters
 ──────────────────────────────
 • SEU to Burst SEU ratio: 10 : 1 (single : burst)
+  – seu_rate parameter = single-bit SEU rate [events/bit/s]
+  – Burst events are an independent Poisson process at 1/10 that rate
 • Burst size distribution:
       2 bits          55 %   (protons / low-LET ions)
       3–4 bits        30 %   (medium-LET ions, GCR)
@@ -41,6 +43,9 @@ except ImportError:
 
 # Cumulative probability thresholds
 _BURST_CDF = np.array([0.55, 0.85, 0.97, 1.00])
+
+# Burst occurrence ratio: burst events per single-bit SEU
+_BURST_SEU_RATIO = 0.1   # 1 burst event per 10 single-bit SEUs
 
 
 def sample_burst_size(rng: np.random.Generator) -> int:
@@ -82,13 +87,14 @@ def inject_errors_leo(flat_page: np.ndarray,
                       ) -> Tuple[np.ndarray, InjectionRecord]:
     """Inject errors into a flat page using the LEO radiation model.
 
-    The SEU rate drives total radiation-event count via Poisson sampling.
-    Events are partitioned 10:1 into single-bit SEUs and multi-bit burst
-    SEUs.  Burst sizes are sampled from the LEO distribution.
+    Single-bit SEUs and burst events are modelled as two independent
+    Poisson processes.  ``seu_rate`` is the single-bit SEU rate; burst
+    events occur at 1/10 of that rate (``_BURST_SEU_RATIO``).
+    Burst sizes are sampled from the LEO distribution.
 
     Args:
         flat_page       : 1-D uint8 array (the full encoded page).
-        seu_rate        : radiation event rate  [events / bit / s].
+        seu_rate        : single-bit SEU rate  [events / bit / s].
         scrub_interval  : seconds between scrubbing events.
         rng             : numpy random Generator for reproducibility.
         page_size_bits  : override total bit count (default: len * 8).
@@ -104,16 +110,17 @@ def inject_errors_leo(flat_page: np.ndarray,
     if seu_rate < 1e-30 or total_bits == 0:
         return out, rec
 
-    # Total radiation events in this scrub window
-    lam_events = seu_rate * total_bits * scrub_interval
-    n_events = int(rng.poisson(lam_events))
-    if n_events == 0:
+    # Single-bit SEUs and burst events are independent Poisson processes.
+    # seu_rate is the single-bit SEU rate; burst rate is 1/10 of that.
+    lam_single = seu_rate * total_bits * scrub_interval
+    lam_burst  = lam_single * _BURST_SEU_RATIO
+
+    n_singles = int(rng.poisson(lam_single))
+    n_bursts  = int(rng.poisson(lam_burst))
+
+    if n_singles == 0 and n_bursts == 0:
         return out, rec
 
-    # Partition into single-bit SEUs and burst events  (10 : 1)
-    # Each event independently has P(burst) = 1/11
-    n_bursts = int(rng.binomial(n_events, 1.0 / 11.0))
-    n_singles = n_events - n_bursts
     rec.n_single_seus = n_singles
     rec.n_burst_events = n_bursts
 
@@ -170,22 +177,22 @@ def inject_errors_leo_conditional(
 ) -> Tuple[np.ndarray, float]:
     """Importance-sampling variant of inject_errors_leo.
 
-    Forces at least one radiation event by sampling from a zero-truncated
-    Poisson distribution (rejection sampling: draw until N >= 1), then
-    applies the LEO burst model exactly as in ``inject_errors_leo``.
+    Forces at least one radiation event (single or burst) by rejection
+    sampling from two independent Poisson processes until the total
+    count is ≥ 1, then applies the LEO burst model exactly as in
+    ``inject_errors_leo``.
 
     The caller is responsible for weighting the resulting UBER estimate by
-    the returned probability ``p_flip = P(≥1 event) = 1 - exp(-λ)`` so that
-    the unconditional UBER is recovered::
+    the returned probability ``p_flip = P(≥1 event) = 1 - exp(-λ_total)``
+    so that the unconditional UBER is recovered::
 
         UBER_true = p_flip * mean(UBER | ≥1 event)
 
-    This avoids wasting iterations on zero-event pages, giving much higher
-    resolution at low SEU rates where most Poisson draws would be zero.
+    ``λ_total = λ_single + λ_burst = λ_single × (1 + _BURST_SEU_RATIO)``.
 
     Args:
         flat_page      : 1-D uint8 array (encoded page).
-        seu_rate       : radiation event rate [events / bit / s].
+        seu_rate       : single-bit SEU rate [events / bit / s].
         scrub_interval : seconds between scrub events.
         rng            : numpy random Generator.
         page_size_bits : override total bit count (default: len * 8).
@@ -196,30 +203,33 @@ def inject_errors_leo_conditional(
     """
     n_bytes = len(flat_page)
     total_bits = page_size_bits if page_size_bits is not None else n_bytes * 8
-    lam_events = seu_rate * total_bits * scrub_interval
+
+    # seu_rate is the single-bit SEU rate; burst rate is 1/10 of that.
+    lam_single = seu_rate * total_bits * scrub_interval
+    lam_burst  = lam_single * _BURST_SEU_RATIO
+    lam_total  = lam_single + lam_burst
 
     # P(at least one radiation event) — the importance weight
-    p_flip = 1.0 - math.exp(-lam_events) if lam_events < 700.0 else 1.0
+    p_flip = 1.0 - math.exp(-lam_total) if lam_total < 700.0 else 1.0
 
-    if lam_events < 1e-300 or total_bits == 0:
+    if lam_total < 1e-300 or total_bits == 0:
         # Essentially zero probability: flip one bit as a degenerate sample.
         # The caller's p_flip weight will suppress this to near zero.
         out = flat_page.copy()
         out[0] ^= np.uint8(1)
         return out, p_flip
 
-    # Zero-truncated Poisson: resample until n_events >= 1 (fast for λ > 0.01;
-    # expected number of rejection steps = exp(λ) / (exp(λ) - 1) ≤ 1/(1-e^-λ))
-    n_events = 0
-    while n_events == 0:
-        n_events = int(rng.poisson(lam_events))
+    # Zero-truncated: resample until at least one event (single or burst)
+    n_singles = 0
+    n_bursts  = 0
+    while n_singles + n_bursts == 0:
+        n_singles = int(rng.poisson(lam_single))
+        n_bursts  = int(rng.poisson(lam_burst))
 
-    # Identical partitioning / injection logic as inject_errors_leo
+    # Injection logic (same as inject_errors_leo)
     out = flat_page.copy()
     rec = InjectionRecord()
 
-    n_bursts  = int(rng.binomial(n_events, 1.0 / 11.0))
-    n_singles = n_events - n_bursts
     rec.n_single_seus   = n_singles
     rec.n_burst_events  = n_bursts
 
