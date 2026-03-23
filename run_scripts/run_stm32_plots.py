@@ -4,7 +4,16 @@ the underlying NAND device delays.
 """
 
 import os
+import sys
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+
+# Ensure repository root is on sys.path so sibling modules resolve
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import lib_timing_stm32 as stm32_env
 from lib_timing_base import build_all_timings, InfeasibleEntry
 

@@ -9,7 +9,8 @@ import argparse
 import math
 import os
 
-from lib_ecc_codecs import compute_data_bytes, _make_bch, BCH_BITS_FROM_ECC
+# Reuse ECC utilities from the main simulator helpers
+from ecc_utils import compute_data_bytes, _make_bch, BCH_BITS_FROM_ECC
 
 # ---------------------------------------------------------------------------
 #  GF arithmetic cycle costs (tunable)
